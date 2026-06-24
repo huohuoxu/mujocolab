@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -117,18 +118,12 @@ class WMPRunner:
     self.history_length = history_length
     self.actor_dim = actor_dim
     self._history = tensors["actor"].unsqueeze(1).repeat(1, history_length, 1)
-    self.depth_update_interval = max(
-      1, int(depth_cfg.get("camera_update_interval", 5))
-    )
+    self.depth_update_interval = max(1, int(depth_cfg.get("camera_update_interval", 5)))
     self.num_camera_envs = min(
       self.num_envs, int(depth_cfg.get("camera_num_envs", self.num_envs))
     )
-    self.predict_non_camera_envs = bool(
-      depth_cfg.get("predict_non_camera_envs", True)
-    )
-    self._depth_camera_env_ids = torch.arange(
-      self.num_camera_envs, device=self.device
-    )
+    self.predict_non_camera_envs = bool(depth_cfg.get("predict_non_camera_envs", True))
+    self._depth_camera_env_ids = torch.arange(self.num_camera_envs, device=self.device)
     self._depth_cache = tensors["depth"].detach().clone()
     self._depth_step = 0
     self._writer = self._make_writer(log_dir)
@@ -161,15 +156,46 @@ class WMPRunner:
     self._history = tensors["actor"].unsqueeze(1).repeat(1, self.history_length, 1)
     start = self.current_learning_iteration
     end = start + num_learning_iterations
+    total_steps = (
+      self.current_learning_iteration * self.num_steps_per_env * self.num_envs
+    )
+    start_time = time.time()
     for iteration in range(start, end):
+      iter_start_time = time.time()
       rollout = self._collect_rollout(obs)
+      collection_time = time.time() - iter_start_time
       obs = rollout["last_obs"]
       update_stats = self._update_policy(rollout)
+      ppo_time = time.time() - iter_start_time - collection_time
+      world_start_time = time.time()
       wm_stats = self._update_world_model(rollout)
+      world_time = time.time() - world_start_time
+      depth_start_time = time.time()
       depth_stats = self._update_depth_predictor(rollout)
+      depth_time = time.time() - depth_start_time
+      amp_start_time = time.time()
       amp_stats = self._update_amp(rollout)
+      amp_time = time.time() - amp_start_time
+      learning_time = ppo_time + world_time + depth_time + amp_time
+      iteration_time = time.time() - iter_start_time
+      total_steps += self.num_steps_per_env * self.num_envs
       self.current_learning_iteration = iteration + 1
-      self._log(iteration + 1, rollout, update_stats, wm_stats, depth_stats, amp_stats)
+      self._log(
+        iteration + 1,
+        end,
+        rollout,
+        update_stats,
+        wm_stats,
+        depth_stats,
+        amp_stats,
+        {
+          "total_steps": float(total_steps),
+          "collection_time": collection_time,
+          "learning_time": learning_time,
+          "iteration_time": iteration_time,
+          "elapsed_time": time.time() - start_time,
+        },
+      )
       save_interval = int(self.cfg["save_interval"])
       if self.log_dir is not None and (iteration + 1) % save_interval == 0:
         self.save(str(Path(self.log_dir) / f"model_{iteration + 1}.pt"))
@@ -294,8 +320,8 @@ class WMPRunner:
     self._history = torch.roll(self._history, shifts=-1, dims=1)
     self._history[:, -1, :] = actor_obs
     if dones.any():
-      self._history[dones] = actor_obs[dones].unsqueeze(1).repeat(
-        1, self.history_length, 1
+      self._history[dones] = (
+        actor_obs[dones].unsqueeze(1).repeat(1, self.history_length, 1)
       )
 
   def _compute_returns(
@@ -367,11 +393,14 @@ class WMPRunner:
           adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1.0e-8)
         ratio = torch.exp(new_log_prob - flat["old_log_prob"][mb])
         surrogate = ratio * adv
-        surrogate_clipped = torch.clamp(
-          ratio,
-          1.0 - clip_param,
-          1.0 + clip_param,
-        ) * adv
+        surrogate_clipped = (
+          torch.clamp(
+            ratio,
+            1.0 - clip_param,
+            1.0 + clip_param,
+          )
+          * adv
+        )
         policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
         value_loss = F.mse_loss(value, flat["returns"][mb])
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
@@ -514,15 +543,31 @@ class WMPRunner:
   def _log(
     self,
     iteration: int,
+    final_iteration: int,
     rollout: dict[str, Any],
     ppo: dict[str, float],
     world: dict[str, float],
     depth: dict[str, float],
     amp: dict[str, float],
+    timing: dict[str, float],
   ) -> None:
     reward = float(rollout["task_rewards"].mean())
+    combined_reward = float(rollout["rewards"].mean())
+    mean_episode_length = float(self.env.episode_length_buf.float().mean())
+    total_steps = int(timing["total_steps"])
+    collection_time = timing["collection_time"]
+    learning_time = timing["learning_time"]
+    iteration_time = timing["iteration_time"]
+    elapsed_time = timing["elapsed_time"]
+    steps_per_second = int(
+      self.num_steps_per_env * self.num_envs / max(iteration_time, 1.0e-9)
+    )
+    remaining_iterations = max(0, final_iteration - iteration)
+    eta_seconds = remaining_iterations * iteration_time
     if self._writer is not None:
       self._writer.add_scalar("Train/task_reward", reward, iteration)
+      self._writer.add_scalar("Train/combined_reward", combined_reward, iteration)
+      self._writer.add_scalar("Train/steps_per_second", steps_per_second, iteration)
       self._writer.add_scalar(
         "Depth/real_fraction", float(rollout["depth_real_fraction"]), iteration
       )
@@ -534,13 +579,96 @@ class WMPRunner:
         self._writer.add_scalar(f"DepthPredictor/{key}", value, iteration)
       for key, value in amp.items():
         self._writer.add_scalar(f"AMP/{key}", value, iteration)
-    if iteration == 1 or iteration % 10 == 0:
+    if iteration == 1 or iteration % 10 == 0 or iteration == final_iteration:
       print(
-        f"[WMP] iter={iteration} "
-        f"reward={reward:.4f} "
-        f"policy_loss={ppo.get('policy_loss', 0.0):.4f} "
-        f"value_loss={ppo.get('value_loss', 0.0):.4f}"
+        self._format_console_log(
+          iteration=iteration,
+          final_iteration=final_iteration,
+          total_steps=total_steps,
+          steps_per_second=steps_per_second,
+          collection_time=collection_time,
+          learning_time=learning_time,
+          iteration_time=iteration_time,
+          elapsed_time=elapsed_time,
+          eta_seconds=eta_seconds,
+          reward=reward,
+          combined_reward=combined_reward,
+          mean_episode_length=mean_episode_length,
+          ppo=ppo,
+          world=world,
+          depth=depth,
+          amp=amp,
+          depth_real_fraction=float(rollout["depth_real_fraction"]),
+        )
       )
+
+  def _format_console_log(
+    self,
+    *,
+    iteration: int,
+    final_iteration: int,
+    total_steps: int,
+    steps_per_second: int,
+    collection_time: float,
+    learning_time: float,
+    iteration_time: float,
+    elapsed_time: float,
+    eta_seconds: float,
+    reward: float,
+    combined_reward: float,
+    mean_episode_length: float,
+    ppo: dict[str, float],
+    world: dict[str, float],
+    depth: dict[str, float],
+    amp: dict[str, float],
+    depth_real_fraction: float,
+  ) -> str:
+    header = f" WMP learning iteration {iteration}/{final_iteration} "
+    width = 80
+    lines = [
+      "\n" + "#" * width,
+      header.center(width),
+      "",
+      f"{'Total steps:':>36} {total_steps}",
+      f"{'Steps per second:':>36} {steps_per_second}",
+      f"{'Collection time:':>36} {collection_time:.3f}s",
+      f"{'Learning time:':>36} {learning_time:.3f}s",
+      f"{'Mean PPO policy loss:':>36} {ppo.get('policy_loss', 0.0):.4f}",
+      f"{'Mean PPO value loss:':>36} {ppo.get('value_loss', 0.0):.4f}",
+      f"{'Mean PPO entropy:':>36} {ppo.get('entropy', 0.0):.4f}",
+      f"{'Mean task reward:':>36} {reward:.4f}",
+      f"{'Mean combined reward:':>36} {combined_reward:.4f}",
+      f"{'Mean episode length:':>36} {mean_episode_length:.2f}",
+      f"{'Mean action std:':>36} {self._mean_action_std():.2f}",
+      f"{'Depth real fraction:':>36} {depth_real_fraction:.4f}",
+      f"{'AMP loss:':>36} {self._format_metric(amp, 'loss')}",
+      f"{'AMP policy acc:':>36} {self._format_metric(amp, 'policy_acc')}",
+      f"{'AMP expert acc:':>36} {self._format_metric(amp, 'expert_acc')}",
+      f"{'WorldModel loss:':>36} {self._format_metric(world, 'loss')}",
+      f"{'WorldModel KL:':>36} {self._format_metric(world, 'kl')}",
+      f"{'WorldModel reward loss:':>36} {self._format_metric(world, 'reward_loss')}",
+      f"{'DepthPredictor loss:':>36} {self._format_metric(depth, 'loss')}",
+      "-" * width,
+      f"{'Iteration time:':>36} {iteration_time:.2f}s",
+      f"{'Time elapsed:':>36} {self._format_seconds(elapsed_time)}",
+      f"{'ETA:':>36} {self._format_seconds(eta_seconds)}",
+      "",
+    ]
+    return "\n".join(lines)
+
+  def _mean_action_std(self) -> float:
+    return float(torch.exp(self.actor_critic.log_std).mean().detach())
+
+  def _format_metric(self, values: dict[str, float], key: str) -> str:
+    if key not in values:
+      return "n/a"
+    return f"{values[key]:.4f}"
+
+  def _format_seconds(self, seconds: float) -> str:
+    seconds_int = max(0, int(seconds))
+    hours, rem = divmod(seconds_int, 3600)
+    minutes, seconds_int = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds_int:02d}"
 
   def save(self, path: str, infos=None) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)

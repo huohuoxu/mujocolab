@@ -28,6 +28,7 @@
   running mean/std 标准化，normalizer state 纳入 checkpoint。
 - M9b RSSM/Dreamer 风格世界模型训练目标：完成。
 - M10 64-env/5-iteration 真实工程回归：完成。
+- M10b WMPRunner 控制台日志增强：完成，不改变训练算法，只补齐终端可观测性。
 
 ## M9b 变更摘要
 
@@ -73,6 +74,11 @@
   - `Depth/real_fraction`: `0.1666666716337204`
 - M10 checkpoint finite 审计：通过，`model_5.pt` 中
   actor/world/depth/AMP/normalizer state 共 12,103,731 个 tensor value 全部 finite。
+- M10b 控制台日志增强验证：通过。
+  - `uv --cache-dir .uv-cache run python -m py_compile src\mjlab\tasks\WMP\rl\runner.py`
+  - `uv --cache-dir .uv-cache run ruff format src\mjlab\tasks\WMP\rl\runner.py`
+  - `uv --cache-dir .uv-cache run ruff check src\mjlab\tasks\WMP\rl\runner.py`
+  - `uv --cache-dir .uv-cache run pytest tests\test_wmp_task.py -q`：`5 passed`。
 - 历史环境 smoke 已通过：
   - `actor`: `[1, 45]`
   - `critic`: `[1, 255]`
