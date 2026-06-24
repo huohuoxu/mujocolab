@@ -1,0 +1,2 @@
+"""WMP task configurations."""
+

@@ -14,6 +14,8 @@ artifacts/
 render_robots.py
 benchmark_results/
 skills/
+.uv-cache/
+.warp-cache/
 
 # Documentation outputs.
 **/_build/*
