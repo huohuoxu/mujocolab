@@ -16,8 +16,9 @@ class _TaskCfg:
 
 
 # Private module-level registry: task_id -> task config.
-_REGISTRY: dict[str, _TaskCfg] = {}
-
+_REGISTRY: dict[str, _TaskCfg] = {} 
+# _REGISTRY 前置下划线：模块私有对象，外部文件不允许直接导入调用
+# 只能通过本模块提供 register_task() / get_task_cfg() 封装函数读写
 
 def register_mjlab_task(
   task_id: str,

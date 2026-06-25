@@ -257,10 +257,9 @@ class WMPRunner:
           amp_reward = self.amp_discriminator.reward(
             amp_obs,
             next_amp_obs,
-            reward_scale=float(self.cfg["amp"].get("reward_scale", 1.0)),
+            reward_scale=float(self.cfg["amp"].get("reward_scale", 0.01)),
           )
-          task_lerp = float(self.cfg["algorithm"].get("amp_task_reward_lerp", 0.3))
-          rewards = task_lerp * task_rewards + (1.0 - task_lerp) * amp_reward
+          rewards = task_rewards + amp_reward
         else:
           rewards = task_rewards
 

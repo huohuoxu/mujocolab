@@ -65,7 +65,9 @@ class MotionLoader:
     self.amp_obs_dim = amp_obs_dim
     self.transition_dim = amp_obs_dim * 2
     self.device = device
-    self._joint_pos_scale = self._resolve_joint_transform(joint_pos_scale, "scale")
+    self._joint_coordinate_scale = self._resolve_joint_transform(
+      joint_pos_scale, "scale"
+    )
     self._joint_pos_bias = self._resolve_joint_transform(joint_pos_bias, "bias")
     transitions = []
     self.source_files: list[str] = []
@@ -181,11 +183,17 @@ class MotionLoader:
   def _apply_joint_transform(self, amp_obs: np.ndarray) -> np.ndarray:
     if self.amp_obs_dim < 12:
       return amp_obs
-    if self._joint_pos_scale is None and self._joint_pos_bias is None:
+    if self._joint_coordinate_scale is None and self._joint_pos_bias is None:
       return amp_obs
     amp_obs = np.array(amp_obs, dtype=np.float32, copy=True)
-    if self._joint_pos_scale is not None:
-      amp_obs[:, :12] *= self._joint_pos_scale
+    if self._joint_coordinate_scale is not None:
+      # A sign/scale change of a joint coordinate must be applied to both
+      # position and velocity. Applying it only to joint_pos makes the expert
+      # transition physically inconsistent: dq/dt and joint_vel point in
+      # opposite directions for flipped coordinates.
+      amp_obs[:, :12] *= self._joint_coordinate_scale
+      if self.amp_obs_dim >= 30:
+        amp_obs[:, 18:30] *= self._joint_coordinate_scale
     if self._joint_pos_bias is not None:
       amp_obs[:, :12] += self._joint_pos_bias
     return amp_obs
@@ -193,7 +201,7 @@ class MotionLoader:
   def _apply_transition_joint_transform(self, transitions: np.ndarray) -> np.ndarray:
     if self.amp_obs_dim < 12:
       return transitions
-    if self._joint_pos_scale is None and self._joint_pos_bias is None:
+    if self._joint_coordinate_scale is None and self._joint_pos_bias is None:
       return transitions
     transitions = np.array(transitions, dtype=np.float32, copy=True)
     first = transitions[:, : self.amp_obs_dim]

@@ -39,6 +39,7 @@ def test_wmp_task_registered_and_cfg_serializable():
   assert data["agent"]["class_name"] == "WMPRunner"
   assert data["agent"]["obs_groups"]["wm_depth"] == ("wm_depth",)
   assert data["agent"]["depth_predictor"]["camera_update_interval"] == 5
+  assert data["agent"]["amp"]["reward_scale"] == 0.01
   assert data["agent"]["amp"]["expert_joint_pos_scale"] == (
     -1.0,
     1.0,
@@ -463,8 +464,12 @@ def test_wmp_motion_loader_joint_stats_and_bias_scale(tmp_path: Path):
 
   expected_first = frames[0, 7:19] * 2.0 + 1.0
   expected_second = frames[1, 7:19] * 2.0 + 1.0
+  expected_vel_first = frames[0, 37:49] * 2.0
+  expected_vel_second = frames[1, 37:49] * 2.0
   assert torch.allclose(loader.transitions[0, :12], expected_first)
+  assert torch.allclose(loader.transitions[0, 18:30], expected_vel_first)
   assert torch.allclose(loader.transitions[0, 30:42], expected_second)
+  assert torch.allclose(loader.transitions[0, 48:60], expected_vel_second)
 
   stats = loader.joint_position_stats()
   assert torch.allclose(stats["min"], expected_first)
@@ -684,7 +689,7 @@ def _tiny_runner_cfg(expert_motion_files: tuple[str, ...] = ()) -> dict:
       "hidden_dims": (16,),
       "learning_rate": 1.0e-3,
       "updates_per_iteration": 1,
-      "reward_scale": 1.0,
+      "reward_scale": 0.01,
       "normalize_input": True,
       "expert_motion_files": expert_motion_files,
     },

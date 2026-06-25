@@ -83,7 +83,7 @@ class WmpAmpCfg:
   hidden_dims: Tuple[int, ...] = (1024, 512)
   learning_rate: float = 1.0e-4
   updates_per_iteration: int = 1
-  reward_scale: float = 1.0
+  reward_scale: float = 0.01
   normalize_input: bool = True
   expert_motion_files: Tuple[str, ...] = field(default_factory=_default_motion_files)
   diagnostics_enabled: bool = True
