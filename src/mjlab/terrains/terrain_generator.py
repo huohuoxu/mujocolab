@@ -55,6 +55,8 @@ class TerrainOutput:
   """List of geometry elements comprising this terrain."""
   flat_patches: dict[str, np.ndarray] | None = None
   """Named sets of flat patch positions, each an (N, 3) array. None if not configured."""
+  metadata: dict[str, np.ndarray] | None = None
+  """Optional named per-patch metadata arrays produced by task-specific terrains."""
 
 
 @dataclass
@@ -170,6 +172,7 @@ class TerrainGenerator:
     self.np_rng = np.random.default_rng(seed)
 
     self.terrain_origins = np.zeros((self.cfg.num_rows, self._num_cols, 3))
+    self.metadata: dict[str, np.ndarray] = {}
 
     # Pre-allocate flat patch storage by scanning all sub-terrain configs.
     self.flat_patches: dict[str, np.ndarray] = {}
@@ -335,6 +338,16 @@ class TerrainGenerator:
         # Sub-terrain didn't produce patches: fill with spawn origin so that
         # every slot contains a valid position for reset_root_state_from_flat_patches.
         arr[sub_row, sub_col] = spawn_origin
+
+    if output.metadata is not None:
+      for name, value in output.metadata.items():
+        metadata_value = np.asarray(value)
+        if name not in self.metadata:
+          self.metadata[name] = np.zeros(
+            (self.cfg.num_rows, self._num_cols, *metadata_value.shape),
+            dtype=metadata_value.dtype,
+          )
+        self.metadata[name][sub_row, sub_col] = metadata_value
 
     return spawn_origin
 

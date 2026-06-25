@@ -86,6 +86,24 @@ class WmpAmpCfg:
   reward_scale: float = 1.0
   normalize_input: bool = True
   expert_motion_files: Tuple[str, ...] = field(default_factory=_default_motion_files)
+  diagnostics_enabled: bool = True
+  joint_offset_warn_abs: float = 0.75
+  joint_offset_warn_mean: float = 0.35
+  expert_joint_pos_scale: Tuple[float, ...] | None = (
+    -1.0,
+    1.0,
+    1.0,
+    -1.0,
+    1.0,
+    1.0,
+    -1.0,
+    1.0,
+    1.0,
+    -1.0,
+    1.0,
+    1.0,
+  )
+  expert_joint_pos_bias: Tuple[float, ...] | None = None
 
 
 @dataclass

@@ -55,9 +55,10 @@ def joint_vel_rel(
   asset = _asset(env, asset_cfg)
   default_joint_vel = asset.data.default_joint_vel
   assert default_joint_vel is not None
-  return asset.data.joint_vel[:, asset_cfg.joint_ids] - default_joint_vel[
-    :, asset_cfg.joint_ids
-  ]
+  return (
+    asset.data.joint_vel[:, asset_cfg.joint_ids]
+    - default_joint_vel[:, asset_cfg.joint_ids]
+  )
 
 
 def last_action(env: ManagerBasedRlEnv, action_name: str | None = None) -> torch.Tensor:
@@ -136,7 +137,8 @@ def depth_image(
   depth = sensor.data.depth
   if depth is None:
     raise RuntimeError(f"Camera sensor {sensor_name!r} has no depth output.")
-  depth = torch.nan_to_num(depth, nan=far_clip, posinf=far_clip, neginf=near_clip)
+  depth = torch.nan_to_num(depth, nan=far_clip, posinf=far_clip, neginf=far_clip)
+  depth = torch.where(depth <= near_clip, torch.full_like(depth, far_clip), depth)
   depth = torch.clamp(depth, near_clip, far_clip)
   return (depth - near_clip) / (far_clip - near_clip) - 0.5
 

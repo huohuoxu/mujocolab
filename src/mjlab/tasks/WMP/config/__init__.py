@@ -1,2 +1,1 @@
 """WMP task configurations."""
-

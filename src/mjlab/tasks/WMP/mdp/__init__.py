@@ -1,3 +1,6 @@
+from mjlab.envs.mdp.events import push_by_setting_velocity as push_by_setting_velocity
+from mjlab.envs.mdp.events import reset_joints_by_offset as reset_joints_by_offset
+from mjlab.envs.mdp.events import reset_root_state_uniform as reset_root_state_uniform
 from mjlab.tasks.WMP.mdp.commands import WmpVelocityCommandCfg as WmpVelocityCommandCfg
 from mjlab.tasks.WMP.mdp.curriculums import commands_vel as commands_vel
 from mjlab.tasks.WMP.mdp.curriculums import terrain_levels_wmp as terrain_levels_wmp
@@ -21,23 +24,29 @@ from mjlab.tasks.WMP.mdp.observations import projected_gravity as projected_grav
 from mjlab.tasks.WMP.mdp.observations import wm_prop as wm_prop
 from mjlab.tasks.WMP.mdp.rewards import action_rate_l2 as action_rate_l2
 from mjlab.tasks.WMP.mdp.rewards import base_height_l2 as base_height_l2
+from mjlab.tasks.WMP.mdp.rewards import cheat as cheat
+from mjlab.tasks.WMP.mdp.rewards import collision_cost as collision_cost
 from mjlab.tasks.WMP.mdp.rewards import dof_acc_l2 as dof_acc_l2
 from mjlab.tasks.WMP.mdp.rewards import dof_error_l2 as dof_error_l2
 from mjlab.tasks.WMP.mdp.rewards import feet_air_time as feet_air_time
 from mjlab.tasks.WMP.mdp.rewards import feet_edge as feet_edge
 from mjlab.tasks.WMP.mdp.rewards import feet_slip as feet_slip
+from mjlab.tasks.WMP.mdp.rewards import feet_stumble as feet_stumble
 from mjlab.tasks.WMP.mdp.rewards import lin_vel_z_l2 as lin_vel_z_l2
+from mjlab.tasks.WMP.mdp.rewards import (
+  only_positive_reward_clip as only_positive_reward_clip,
+)
 from mjlab.tasks.WMP.mdp.rewards import self_collision_cost as self_collision_cost
+from mjlab.tasks.WMP.mdp.rewards import stuck as stuck
 from mjlab.tasks.WMP.mdp.rewards import stumble as stumble
+from mjlab.tasks.WMP.mdp.rewards import torques_l2 as torques_l2
 from mjlab.tasks.WMP.mdp.rewards import track_angular_velocity as track_angular_velocity
 from mjlab.tasks.WMP.mdp.rewards import track_linear_velocity as track_linear_velocity
 from mjlab.tasks.WMP.mdp.rewards import upright as upright
+from mjlab.tasks.WMP.mdp.rewards import wmp_feet_edge_coef as wmp_feet_edge_coef
 from mjlab.tasks.WMP.mdp.terminations import bad_orientation as bad_orientation
 from mjlab.tasks.WMP.mdp.terminations import illegal_contact as illegal_contact
 from mjlab.tasks.WMP.mdp.terminations import (
   out_of_terrain_bounds as out_of_terrain_bounds,
 )
 from mjlab.tasks.WMP.mdp.terminations import time_out as time_out
-from mjlab.envs.mdp.events import push_by_setting_velocity as push_by_setting_velocity
-from mjlab.envs.mdp.events import reset_joints_by_offset as reset_joints_by_offset
-from mjlab.envs.mdp.events import reset_root_state_uniform as reset_root_state_uniform

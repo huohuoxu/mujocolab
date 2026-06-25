@@ -57,11 +57,16 @@ class MotionLoader:
     motion_files: Iterable[str],
     amp_obs_dim: int,
     device: torch.device,
+    *,
+    joint_pos_scale: Iterable[float] | None = None,
+    joint_pos_bias: Iterable[float] | None = None,
   ) -> None:
     motion_files = tuple(motion_files)
     self.amp_obs_dim = amp_obs_dim
     self.transition_dim = amp_obs_dim * 2
     self.device = device
+    self._joint_pos_scale = self._resolve_joint_transform(joint_pos_scale, "scale")
+    self._joint_pos_bias = self._resolve_joint_transform(joint_pos_bias, "bias")
     transitions = []
     self.source_files: list[str] = []
     for pattern in motion_files:
@@ -84,6 +89,28 @@ class MotionLoader:
   @property
   def has_data(self) -> bool:
     return self.transitions.numel() > 0
+
+  def joint_position_stats(self) -> dict[str, torch.Tensor]:
+    if not self.has_data or self.amp_obs_dim < 12:
+      empty = torch.empty(0, device=self.device)
+      return {"min": empty, "mean": empty, "max": empty, "std": empty}
+    joint_pos = self.transitions[:, :12]
+    return {
+      "min": joint_pos.min(dim=0).values,
+      "mean": joint_pos.mean(dim=0),
+      "max": joint_pos.max(dim=0).values,
+      "std": joint_pos.std(dim=0, unbiased=False),
+    }
+
+  def _resolve_joint_transform(
+    self, values: Iterable[float] | None, name: str
+  ) -> np.ndarray | None:
+    if values is None:
+      return None
+    array = np.asarray(tuple(values), dtype=np.float32)
+    if array.shape != (12,):
+      raise ValueError(f"AMP expert_joint_pos_{name} must contain exactly 12 values.")
+    return array
 
   def _expand_pattern(self, pattern: str) -> list[Path]:
     expanded = os.path.expandvars(pattern)
@@ -111,8 +138,10 @@ class MotionLoader:
       return None
     if array.shape[1] >= self.transition_dim:
       data = array[:, : self.transition_dim]
+      data = self._apply_transition_joint_transform(data)
     elif array.shape[1] >= self.amp_obs_dim and array.shape[0] >= 2:
       obs = array[:, : self.amp_obs_dim]
+      obs = self._apply_joint_transform(obs)
       data = np.concatenate((obs[:-1], obs[1:]), axis=-1)
     else:
       return None
@@ -145,8 +174,35 @@ class MotionLoader:
     else:
       return None
 
+    amp_obs = self._apply_joint_transform(amp_obs)
     transitions = np.concatenate((amp_obs[:-1], amp_obs[1:]), axis=-1)
     return torch.from_numpy(np.ascontiguousarray(transitions))
+
+  def _apply_joint_transform(self, amp_obs: np.ndarray) -> np.ndarray:
+    if self.amp_obs_dim < 12:
+      return amp_obs
+    if self._joint_pos_scale is None and self._joint_pos_bias is None:
+      return amp_obs
+    amp_obs = np.array(amp_obs, dtype=np.float32, copy=True)
+    if self._joint_pos_scale is not None:
+      amp_obs[:, :12] *= self._joint_pos_scale
+    if self._joint_pos_bias is not None:
+      amp_obs[:, :12] += self._joint_pos_bias
+    return amp_obs
+
+  def _apply_transition_joint_transform(self, transitions: np.ndarray) -> np.ndarray:
+    if self.amp_obs_dim < 12:
+      return transitions
+    if self._joint_pos_scale is None and self._joint_pos_bias is None:
+      return transitions
+    transitions = np.array(transitions, dtype=np.float32, copy=True)
+    first = transitions[:, : self.amp_obs_dim]
+    second = transitions[:, self.amp_obs_dim : self.transition_dim]
+    transitions[:, : self.amp_obs_dim] = self._apply_joint_transform(first)
+    transitions[:, self.amp_obs_dim : self.transition_dim] = (
+      self._apply_joint_transform(second)
+    )
+    return transitions
 
   def sample(self, batch_size: int) -> torch.Tensor | None:
     if not self.has_data:

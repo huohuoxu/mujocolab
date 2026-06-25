@@ -153,11 +153,16 @@ class TerrainEntity(Entity):
       self._flat_patch_radii: dict[str, float] = dict(
         terrain_generator.flat_patch_radii
       )
+      self._metadata: dict[str, torch.Tensor] = {
+        name: torch.from_numpy(arr).to(device=self._device)
+        for name, arr in terrain_generator.metadata.items()
+      }
     elif self.cfg.terrain_type == "plane":
       self._import_ground_plane("terrain")
       self._configure_env_origins()
       self._flat_patches: dict[str, torch.Tensor] = {}
       self._flat_patch_radii: dict[str, float] = {}
+      self._metadata: dict[str, torch.Tensor] = {}
     else:
       raise ValueError(f"Unknown terrain type: {self.cfg.terrain_type}")
 
@@ -178,6 +183,10 @@ class TerrainEntity(Entity):
   @property
   def flat_patch_radii(self) -> dict[str, float]:
     return self._flat_patch_radii
+
+  @property
+  def metadata(self) -> dict[str, torch.Tensor]:
+    return self._metadata
 
   # Terrain origin management.
 

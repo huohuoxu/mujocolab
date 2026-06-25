@@ -113,7 +113,14 @@ class WMPRunner:
       amp_cfg.get("expert_motion_files", ()),
       amp_obs_dim,
       self.device,
+      joint_pos_scale=amp_cfg.get("expert_joint_pos_scale"),
+      joint_pos_bias=amp_cfg.get("expert_joint_pos_bias"),
     )
+    if bool(amp_cfg.get("diagnostics_enabled", True)):
+      self._print_amp_diagnostics(
+        warn_mean=float(amp_cfg.get("joint_offset_warn_mean", 0.35)),
+        warn_abs=float(amp_cfg.get("joint_offset_warn_abs", 0.75)),
+      )
 
     self.history_length = history_length
     self.actor_dim = actor_dim
@@ -161,6 +168,7 @@ class WMPRunner:
     )
     start_time = time.time()
     for iteration in range(start, end):
+      self.env.unwrapped._wmp_iteration = iteration
       iter_start_time = time.time()
       rollout = self._collect_rollout(obs)
       collection_time = time.time() - iter_start_time
@@ -579,6 +587,11 @@ class WMPRunner:
         self._writer.add_scalar(f"DepthPredictor/{key}", value, iteration)
       for key, value in amp.items():
         self._writer.add_scalar(f"AMP/{key}", value, iteration)
+      self._writer.add_scalar(
+        "Reward/feet_edge_coef",
+        float(getattr(self.env.unwrapped, "_wmp_feet_edge_coef", 0.1)),
+        iteration,
+      )
     if iteration == 1 or iteration % 10 == 0 or iteration == final_iteration:
       print(
         self._format_console_log(
@@ -599,6 +612,7 @@ class WMPRunner:
           depth=depth,
           amp=amp,
           depth_real_fraction=float(rollout["depth_real_fraction"]),
+          feet_edge_coef=float(getattr(self.env.unwrapped, "_wmp_feet_edge_coef", 0.1)),
         )
       )
 
@@ -622,6 +636,7 @@ class WMPRunner:
     depth: dict[str, float],
     amp: dict[str, float],
     depth_real_fraction: float,
+    feet_edge_coef: float,
   ) -> str:
     header = f" WMP learning iteration {iteration}/{final_iteration} "
     width = 80
@@ -640,6 +655,7 @@ class WMPRunner:
       f"{'Mean combined reward:':>36} {combined_reward:.4f}",
       f"{'Mean episode length:':>36} {mean_episode_length:.2f}",
       f"{'Mean action std:':>36} {self._mean_action_std():.2f}",
+      f"{'Feet edge coef:':>36} {feet_edge_coef:.4f}",
       f"{'Depth real fraction:':>36} {depth_real_fraction:.4f}",
       f"{'AMP loss:':>36} {self._format_metric(amp, 'loss')}",
       f"{'AMP policy acc:':>36} {self._format_metric(amp, 'policy_acc')}",
@@ -669,6 +685,62 @@ class WMPRunner:
     hours, rem = divmod(seconds_int, 3600)
     minutes, seconds_int = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds_int:02d}"
+
+  def _print_amp_diagnostics(self, warn_mean: float, warn_abs: float) -> None:
+    if not self.motion_loader.has_data:
+      return
+    robot = self._get_robot_entity()
+    if robot is None:
+      return
+    default_joint_pos = getattr(robot.data, "default_joint_pos", None)
+    if default_joint_pos is None or default_joint_pos.shape[-1] < 12:
+      return
+    default_joint_pos = default_joint_pos[0, :12].detach().to(self.device)
+    motion_stats = self.motion_loader.joint_position_stats()
+    motion_mean = motion_stats["mean"]
+    if motion_mean.numel() < 12:
+      return
+    motion_mean = motion_mean[:12].to(self.device)
+    offset = motion_mean - default_joint_pos
+    mean_abs = float(torch.mean(torch.abs(offset)))
+    max_abs = float(torch.max(torch.abs(offset)))
+    joint_names = tuple(getattr(robot, "joint_names", ()))[:12]
+    print("[WMP][AMP] Go1 joint order:", joint_names)
+    print(
+      "[WMP][AMP] Go1 default joint pos:",
+      self._format_vector(default_joint_pos),
+    )
+    print(
+      "[WMP][AMP] Motion joint pos min/mean/max/std:",
+      "min=",
+      self._format_vector(motion_stats["min"][:12]),
+      "mean=",
+      self._format_vector(motion_mean),
+      "max=",
+      self._format_vector(motion_stats["max"][:12]),
+      "std=",
+      self._format_vector(motion_stats["std"][:12]),
+    )
+    print(
+      f"[WMP][AMP] Motion-Go1 default offset: mean_abs={mean_abs:.4f}, "
+      f"max_abs={max_abs:.4f}"
+    )
+    if mean_abs > warn_mean or max_abs > warn_abs:
+      print(
+        "[WMP][AMP][WARN] Expert motion joint distribution differs from Go1 "
+        "default posture; consider expert_joint_pos_bias/scale or retargeting "
+        "if AMP reward/loss becomes abnormal."
+      )
+
+  def _get_robot_entity(self):
+    try:
+      return self.env.unwrapped.scene["robot"]
+    except Exception:
+      return None
+
+  def _format_vector(self, tensor: torch.Tensor, precision: int = 3) -> str:
+    values = tensor.detach().cpu().flatten().tolist()
+    return "[" + ", ".join(f"{float(v):.{precision}f}" for v in values) + "]"
 
   def save(self, path: str, infos=None) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)

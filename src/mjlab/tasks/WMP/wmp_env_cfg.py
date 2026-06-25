@@ -36,9 +36,63 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
 
-def _camera_quat_pitch_down(degrees: float) -> tuple[float, float, float, float]:
-  pitch = math.radians(degrees)
-  return (math.cos(pitch / 2), 0.0, math.sin(pitch / 2), 0.0)
+def _quat_from_matrix(rows: tuple[tuple[float, float, float], ...]):
+  m00, m01, m02 = rows[0]
+  m10, m11, m12 = rows[1]
+  m20, m21, m22 = rows[2]
+  trace = m00 + m11 + m22
+  if trace > 0.0:
+    s = math.sqrt(trace + 1.0) * 2.0
+    quat = (
+      0.25 * s,
+      (m21 - m12) / s,
+      (m02 - m20) / s,
+      (m10 - m01) / s,
+    )
+  elif m00 > m11 and m00 > m22:
+    s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+    quat = (
+      (m21 - m12) / s,
+      0.25 * s,
+      (m01 + m10) / s,
+      (m02 + m20) / s,
+    )
+  elif m11 > m22:
+    s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+    quat = (
+      (m02 - m20) / s,
+      (m01 + m10) / s,
+      0.25 * s,
+      (m12 + m21) / s,
+    )
+  else:
+    s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+    quat = (
+      (m10 - m01) / s,
+      (m02 + m20) / s,
+      (m12 + m21) / s,
+      0.25 * s,
+    )
+  norm = math.sqrt(sum(value * value for value in quat))
+  return tuple(value / norm for value in quat)
+
+
+def _camera_quat_forward_down(degrees: float) -> tuple[float, float, float, float]:
+  down = math.radians(degrees)
+  cos_down = math.cos(down)
+  sin_down = math.sin(down)
+  # MuJoCo cameras look along local -Z.  Go1 trunk +X is forward and +Y is left,
+  # so local +X is robot-right (-Y), while local -Z points forward and down.
+  x_axis = (0.0, -1.0, 0.0)
+  y_axis = (sin_down, 0.0, cos_down)
+  z_axis = (-cos_down, 0.0, sin_down)
+  return _quat_from_matrix(
+    (
+      (x_axis[0], y_axis[0], z_axis[0]),
+      (x_axis[1], y_axis[1], z_axis[1]),
+      (x_axis[2], y_axis[2], z_axis[2]),
+    )
+  )
 
 
 def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -79,7 +133,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     name="front_depth_camera",
     parent_body="robot/trunk",
     pos=(0.27, 0.0, 0.03),
-    quat=_camera_quat_pitch_down(-5.0),
+    quat=_camera_quat_forward_down(5.0),
     fovy=58.0,
     width=64,
     height=64,
@@ -242,16 +296,24 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   commands: dict[str, CommandTermCfg] = {
     "twist": WmpVelocityCommandCfg(
       entity_name="robot",
-      resampling_time_range=(6.0, 10.0),
-      heading_command=False,
+      resampling_time_range=(10.0, 10.0),
+      heading_command=True,
+      heading_control_stiffness=0.5,
       rel_standing_envs=0.05,
-      rel_forward_envs=0.85,
+      rel_heading_envs=1.0,
+      rel_forward_envs=1.0,
       debug_vis=True,
       ranges=WmpVelocityCommandCfg.Ranges(
         lin_vel_x=(0.0, 0.8),
         lin_vel_y=(0.0, 0.0),
         ang_vel_z=(-1.0, 1.0),
-        heading=None,
+        heading=(0.0, 0.0),
+      ),
+      flat_ranges=WmpVelocityCommandCfg.Ranges(
+        lin_vel_x=(0.0, 0.8),
+        lin_vel_y=(0.0, 0.0),
+        ang_vel_z=(-1.0, 1.0),
+        heading=(-math.pi / 4.0, math.pi / 4.0),
       ),
     )
   }
@@ -332,7 +394,11 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       params={"command_name": "twist", "std": 0.15},
     ),
     "lin_vel_z": RewardTermCfg(func=mdp.lin_vel_z_l2, weight=-1.0),
-    "upright": RewardTermCfg(func=mdp.upright, weight=0.25, params={"std": 0.2}),
+    "torques": RewardTermCfg(
+      func=mdp.torques_l2,
+      weight=-1.0e-4,
+      params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
+    ),
     "dof_acc": RewardTermCfg(func=mdp.dof_acc_l2, weight=-2.5e-7),
     "action_rate": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.03),
     "dof_error": RewardTermCfg(func=mdp.dof_error_l2, weight=-0.04),
@@ -341,34 +407,41 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       weight=0.5,
       params={"sensor_name": "feet_ground_contact", "command_name": "twist"},
     ),
-    "feet_slip": RewardTermCfg(
-      func=mdp.feet_slip,
-      weight=-0.1,
+    "collision": RewardTermCfg(
+      func=mdp.collision_cost,
+      weight=-1.0,
       params={
-        "sensor_name": "feet_ground_contact",
-        "command_name": "twist",
-        "asset_cfg": SceneEntityCfg("robot", site_names=feet),
+        "sensor_names": ("thigh_ground_touch", "shank_ground_touch"),
+        "force_threshold": 0.1,
       },
     ),
-    "collision": RewardTermCfg(
-      func=mdp.self_collision_cost,
-      weight=-1.0,
-      params={"sensor_name": "shank_ground_touch"},
+    "feet_stumble": RewardTermCfg(
+      func=mdp.feet_stumble,
+      weight=-0.1,
+      params={"sensor_name": "feet_ground_contact"},
     ),
-    "trunk_collision": RewardTermCfg(
-      func=mdp.self_collision_cost,
+    "feet_edge": RewardTermCfg(
+      func=mdp.feet_edge,
       weight=-1.0,
-      params={"sensor_name": "trunk_ground_touch"},
+      params={
+        "sensor_name": "feet_ground_contact",
+        "asset_cfg": SceneEntityCfg("robot", site_names=feet, preserve_order=True),
+      },
     ),
-    "feet_edge": RewardTermCfg(func=mdp.feet_edge, weight=-1.0),
+    "cheat": RewardTermCfg(func=mdp.cheat, weight=-1.0),
+    "stuck": RewardTermCfg(
+      func=mdp.stuck,
+      weight=-1.0,
+      params={"command_name": "twist"},
+    ),
+    "only_positive_clip": RewardTermCfg(
+      func=mdp.only_positive_reward_clip,
+      weight=1.0,
+    ),
   }
 
   terminations = {
     "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
-    "illegal_thigh_contact": TerminationTermCfg(
-      func=mdp.illegal_contact,
-      params={"sensor_name": "thigh_ground_touch"},
-    ),
     "base_contact": TerminationTermCfg(
       func=mdp.illegal_contact,
       params={"sensor_name": "trunk_ground_touch"},
