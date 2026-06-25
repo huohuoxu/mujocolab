@@ -327,10 +327,10 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # rl/config.py 和 WMPRunner._obs_to_tensors() 会把这些名字映射到actor、critic、world model、depth predictor、AMP 的输入
 
   # actor 观测：本体感知 + 速度命令 + 上一步动作
+  # 这里的 actor_term 不是 actor 网络全部输入，而只是仿真环境能直接给出的观测，actor 网络最终输入还包括 runner 计算出来的 wm_feature：h_t
   # 不包含真实 base 线速度、接触力、稠密地形扫描等 privileged 信息，更接近真实部署时可获得的输入。训练时是否加噪由 group cfg 控制
-  # 注意这里的 actor_terms 只是 环境侧 actor 观测组，不是 actor 网络的完整最终输入
-  # World model 从 depth 里提取的 h_t 是在 WMPRunner 里算出来，再作为单独参数喂给 ActorCriticWMP
-  # 所以不会出现在 当前的 actor_terms 里
+  # 注意这里的 actor_terms 只是 仿真环境侧 actor 观测组，不是 actor 网络的完整最终输入
+  # World model 从 depth 里提取的 h_t 是在 WMPRunner 里算出来，再作为单独参数喂给 ActorCriticWMP，所以不会出现在当前的 actor_terms 里
   actor_terms = {
     "base_ang_vel": ObservationTermCfg(
       func=mdp.base_ang_vel,
@@ -354,8 +354,8 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     "actions": ObservationTermCfg(func=mdp.last_action),
   }
 
-  # critic 观测：actor terms 加上仿真/传感器特权状态。
-  # value function 训练时可以看更丰富的信息，但这些信息不会暴露给部署策略。
+  # critic 观测：actor terms 加上仿真/传感器特权状态
+  # 保证 value function 训练时可以看更丰富的信息以实现更准确的价值估计，但这些信息不会暴露给部署策略
   critic_terms = {
     "base_lin_vel": ObservationTermCfg(func=mdp.base_lin_vel),
     **actor_terms,
