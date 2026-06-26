@@ -27,6 +27,7 @@ from mjlab.tasks.WMP.rl.modules import (
 from mjlab.tasks.WMP.rl.runner import WMPRunner
 
 TASK_ID = "Mjlab-WMP-Rough-Unitree-Go1"
+STAIRS_ONLY_TASK_ID = "Mjlab-WMP-Stairs-Only-Unitree-Go1"
 
 
 def test_wmp_task_registered_and_cfg_serializable():
@@ -118,6 +119,43 @@ def test_wmp_play_randomizes_terrain_origin_before_base_reset():
   )
   assert cfg.events["randomize_play_terrain"].func is mdp.randomize_play_terrain
   assert cfg.curriculum == {}
+
+
+def test_wmp_stairs_only_task_registered_without_amp():
+  assert STAIRS_ONLY_TASK_ID in list_tasks()
+  assert load_runner_cls(STAIRS_ONLY_TASK_ID) is WMPRunner
+
+  cfg = TrainConfig.from_task(STAIRS_ONLY_TASK_ID)
+
+  assert cfg.agent.class_name == "WMPRunner"
+  assert cfg.agent.run_name == "stairs_only_no_amp"
+  assert cfg.agent.amp.expert_motion_files == ()
+  assert cfg.agent.amp.reward_scale == 0.0
+  assert cfg.agent.amp.updates_per_iteration == 0
+  assert not cfg.agent.amp.diagnostics_enabled
+
+  terrain_cfg = cfg.env.scene.terrain.terrain_generator
+  assert terrain_cfg is not None
+  terrain_names = tuple(terrain_cfg.sub_terrains)
+  assert terrain_cfg.curriculum
+  assert terrain_cfg.num_rows == 10
+  assert terrain_cfg.num_cols == 6
+  assert terrain_names == (
+    "stairs_up_0",
+    "stairs_up_1",
+    "stairs_up_2",
+    "stairs_down_0",
+    "stairs_down_1",
+    "stairs_down_2",
+  )
+
+  play_cfg = load_env_cfg(STAIRS_ONLY_TASK_ID, play=True)
+  play_terrain_cfg = play_cfg.scene.terrain.terrain_generator
+  assert play_terrain_cfg is not None
+  assert tuple(play_terrain_cfg.sub_terrains) == terrain_names
+  assert play_cfg.scene.num_envs == len(terrain_names)
+  assert "randomize_play_terrain" in play_cfg.events
+  assert play_cfg.curriculum == {}
 
 
 def _quat_to_matrix(quat: tuple[float, float, float, float]) -> torch.Tensor:

@@ -4,3 +4,9 @@ from mjlab.tasks.WMP.wmp_env_cfg import make_wmp_go1_env_cfg
 
 def unitree_go1_wmp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   return make_wmp_go1_env_cfg(play=play)
+
+
+def unitree_go1_wmp_stairs_only_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  return make_wmp_go1_env_cfg(play=play, terrain_profile="stairs_only")

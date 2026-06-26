@@ -271,6 +271,37 @@ def _terrain_columns(
   return {f"{prefix}_{idx}": replace(cfg, proportion=1.0) for idx in range(count)}
 
 
+_WMP_STAIRS_UP_CFG = BoxPyramidStairsTerrainCfg(
+  proportion=1.0,
+  step_height_range=(0.05, 0.23),
+  step_width=0.32,
+  platform_width=3.0,
+  border_width=0.25,
+)
+
+_WMP_STAIRS_DOWN_CFG = BoxInvertedPyramidStairsTerrainCfg(
+  proportion=1.0,
+  step_height_range=(0.05, 0.23),
+  step_width=0.32,
+  platform_width=3.0,
+  border_width=0.25,
+)
+
+
+WMP_STAIRS_ONLY_TERRAINS_CFG = TerrainGeneratorCfg(
+  size=(8.0, 8.0),
+  border_width=25.0,
+  num_rows=10,
+  num_cols=6,
+  curriculum=True,
+  sub_terrains={
+    **_terrain_columns("stairs_up", _WMP_STAIRS_UP_CFG, 3),
+    **_terrain_columns("stairs_down", _WMP_STAIRS_DOWN_CFG, 3),
+  },
+  add_lights=True,
+)
+
+
 WMP_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
   size=(8.0, 8.0),
   border_width=25.0,
@@ -286,24 +317,12 @@ WMP_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     ),
     **_terrain_columns(
       "stairs_up",
-      BoxPyramidStairsTerrainCfg(
-        proportion=1.0,
-        step_height_range=(0.05, 0.23),
-        step_width=0.32,
-        platform_width=3.0,
-        border_width=0.25,
-      ),
+      _WMP_STAIRS_UP_CFG,
       3,
     ),
     **_terrain_columns(
       "stairs_down",
-      BoxInvertedPyramidStairsTerrainCfg(
-        proportion=1.0,
-        step_height_range=(0.05, 0.23),
-        step_width=0.32,
-        platform_width=3.0,
-        border_width=0.25,
-      ),
+      _WMP_STAIRS_DOWN_CFG,
       3,
     ),
     **_terrain_columns("gap", BoxGapTerrainCfg(proportion=1.0), 5),

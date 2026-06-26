@@ -43,7 +43,11 @@ from mjlab.sensor import (
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.WMP import mdp
 from mjlab.tasks.WMP.mdp import WmpVelocityCommandCfg
-from mjlab.tasks.WMP.terrains import WMP_PLAY_TERRAINS_CFG, WMP_ROUGH_TERRAINS_CFG
+from mjlab.tasks.WMP.terrains import (
+  WMP_PLAY_TERRAINS_CFG,
+  WMP_ROUGH_TERRAINS_CFG,
+  WMP_STAIRS_ONLY_TERRAINS_CFG,
+)
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
@@ -117,7 +121,11 @@ def _camera_quat_forward_down(degrees: float) -> tuple[float, float, float, floa
   )
 
 
-def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+def make_wmp_go1_env_cfg(
+  play: bool = False,
+  *,
+  terrain_profile: str = "rough",
+) -> ManagerBasedRlEnvCfg:
   """创建 WMP + Go1 的完整 manager-based 环境配置
 
   Args:
@@ -691,8 +699,23 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # play 模式使用独立地形集合，关闭随机推扰，并冻结课程学习
   # 这样可视化时环境变化更少，方便判断策略是否真的会走
-  terrain_cfg = WMP_PLAY_TERRAINS_CFG if play else WMP_ROUGH_TERRAINS_CFG
+  terrain_profiles = {
+    "rough": WMP_ROUGH_TERRAINS_CFG,
+    "stairs_only": WMP_STAIRS_ONLY_TERRAINS_CFG,
+  }
+  if terrain_profile not in terrain_profiles:
+    raise ValueError(
+      f"Unknown WMP terrain_profile '{terrain_profile}'. "
+      f"Expected one of {tuple(terrain_profiles)}."
+    )
+  terrain_cfg = (
+    WMP_PLAY_TERRAINS_CFG
+    if play and terrain_profile == "rough"
+    else terrain_profiles[terrain_profile]
+  )
   if play:
+    # Play keeps the same terrain family as training. The reset event below
+    # spreads visible envs across the available terrain columns.
     events.pop("push_robot", None)
     events = {
       "randomize_play_terrain": EventTermCfg(
