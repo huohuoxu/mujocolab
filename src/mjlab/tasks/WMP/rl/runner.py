@@ -133,6 +133,7 @@ class WMPRunner:
     self._depth_camera_env_ids = torch.arange(self.num_camera_envs, device=self.device)
     self._depth_cache = tensors["depth"].detach().clone()
     self._depth_step = 0
+    self._action_names = self._resolve_action_names(action_dim)
     self._writer = self._make_writer(log_dir)
 
   def _make_writer(self, log_dir: str | None):
@@ -224,6 +225,7 @@ class WMPRunner:
       "values": [],
       "rewards": [],
       "task_rewards": [],
+      "reward_terms": [],
       "dones": [],
       "wm_prop": [],
       "next_wm_prop": [],
@@ -246,6 +248,7 @@ class WMPRunner:
           wm_feature,
         )
       next_obs, task_rewards, dones, _extras = self.env.step(actions)
+      reward_terms = self._current_reward_terms()
       next_tensors = self._obs_to_tensors(next_obs)
       done_mask = dones.bool()
       if done_mask.any():
@@ -272,6 +275,7 @@ class WMPRunner:
       storage["values"].append(values.detach())
       storage["rewards"].append(rewards.detach())
       storage["task_rewards"].append(task_rewards.detach())
+      storage["reward_terms"].append(reward_terms)
       storage["dones"].append(dones.float())
       storage["wm_prop"].append(tensors["wm_prop"])
       storage["next_wm_prop"].append(next_tensors["wm_prop"])
@@ -578,6 +582,9 @@ class WMPRunner:
       self._writer.add_scalar(
         "Depth/real_fraction", float(rollout["depth_real_fraction"]), iteration
       )
+      self._writer.add_scalar("PPO/action_std", self._mean_action_std(), iteration)
+      self._log_action_statistics(rollout["actions"], iteration)
+      self._log_reward_terms(rollout["reward_terms"], iteration)
       for key, value in ppo.items():
         self._writer.add_scalar(f"PPO/{key}", value, iteration)
       for key, value in world.items():
@@ -673,6 +680,60 @@ class WMPRunner:
 
   def _mean_action_std(self) -> float:
     return float(torch.exp(self.actor_critic.log_std).mean().detach())
+
+  def _resolve_action_names(self, action_dim: int) -> tuple[str, ...]:
+    try:
+      action_manager = self.env.unwrapped.action_manager
+      names: list[str] = []
+      for term_name in action_manager.active_terms:
+        term = action_manager.get_term(term_name)
+        target_names = getattr(term, "target_names", None)
+        if target_names is None:
+          names.extend(f"{term_name}_{idx:02d}" for idx in range(term.action_dim))
+        else:
+          names.extend(str(name).replace("/", "_") for name in target_names)
+      if len(names) == action_dim:
+        return tuple(names)
+    except Exception:
+      pass
+    return tuple(f"joint_{idx:02d}" for idx in range(action_dim))
+
+  def _log_action_statistics(self, actions: torch.Tensor, iteration: int) -> None:
+    if self._writer is None:
+      return
+    flat_actions = actions.reshape(-1, actions.shape[-1])
+    means = flat_actions.mean(dim=0)
+    stds = flat_actions.std(dim=0, unbiased=False)
+    abs_means = flat_actions.abs().mean(dim=0)
+    for idx, name in enumerate(self._action_names):
+      self._writer.add_scalar(f"Action/{name}_mean", float(means[idx]), iteration)
+      self._writer.add_scalar(f"Action/{name}_std", float(stds[idx]), iteration)
+      self._writer.add_scalar(
+        f"Action/{name}_abs_mean", float(abs_means[idx]), iteration
+      )
+
+  def _current_reward_terms(self) -> torch.Tensor:
+    reward_manager = getattr(self.env.unwrapped, "reward_manager", None)
+    if reward_manager is None or not hasattr(reward_manager, "_step_reward"):
+      return torch.zeros(
+        self.num_envs,
+        0,
+        device=self.device,
+        dtype=torch.float32,
+      )
+    return reward_manager._step_reward.detach().clone()
+
+  def _log_reward_terms(self, reward_terms: torch.Tensor, iteration: int) -> None:
+    if self._writer is None or reward_terms.shape[-1] == 0:
+      return
+    reward_manager = getattr(self.env.unwrapped, "reward_manager", None)
+    term_names = tuple(getattr(reward_manager, "active_terms", ()))
+    if len(term_names) != reward_terms.shape[-1]:
+      term_names = tuple(f"term_{idx:02d}" for idx in range(reward_terms.shape[-1]))
+    flat_terms = reward_terms.reshape(-1, reward_terms.shape[-1])
+    means = flat_terms.mean(dim=0)
+    for idx, name in enumerate(term_names):
+      self._writer.add_scalar(f"RewardTerms/{name}", float(means[idx]), iteration)
 
   def _format_metric(self, values: dict[str, float], key: str) -> str:
     if key not in values:

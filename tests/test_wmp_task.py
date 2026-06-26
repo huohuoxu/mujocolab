@@ -749,6 +749,75 @@ def _tiny_runner_cfg(expert_motion_files: tuple[str, ...] = ()) -> dict:
   }
 
 
+class _FakeWriter:
+  def __init__(self) -> None:
+    self.scalars: dict[str, list[tuple[int, float]]] = {}
+
+  def add_scalar(self, tag: str, value, step: int) -> None:
+    self.scalars.setdefault(tag, []).append((step, float(value)))
+
+
+class _FakeRunnerRewardManager:
+  active_terms = ("tracking_lin_vel", "action_rate")
+
+  def __init__(self) -> None:
+    self._step_reward = torch.zeros(2, 2)
+
+
+def test_wmp_runner_logs_action_std_action_stats_and_reward_terms():
+  env = _FakeWmpEnv()
+  env.reward_manager = _FakeRunnerRewardManager()
+  runner = WMPRunner(
+    env,
+    _tiny_runner_cfg(()),
+    device="cpu",
+  )
+  writer = _FakeWriter()
+  runner._writer = writer
+  actions = torch.arange(2 * env.num_envs * env.num_actions, dtype=torch.float32)
+  actions = actions.reshape(2, env.num_envs, env.num_actions)
+  reward_terms = torch.tensor(
+    [
+      [[1.0, -0.5], [2.0, -1.5]],
+      [[3.0, -2.5], [4.0, -3.5]],
+    ],
+    dtype=torch.float32,
+  )
+  rollout = {
+    "task_rewards": torch.ones(2, env.num_envs),
+    "rewards": torch.ones(2, env.num_envs) * 1.5,
+    "depth_real_fraction": torch.tensor(0.5),
+    "actions": actions,
+    "reward_terms": reward_terms,
+  }
+
+  runner._log(
+    iteration=1,
+    final_iteration=1,
+    rollout=rollout,
+    ppo={"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0},
+    world={},
+    depth={},
+    amp={},
+    timing={
+      "total_steps": 4,
+      "collection_time": 0.0,
+      "learning_time": 0.0,
+      "iteration_time": 1.0,
+      "elapsed_time": 1.0,
+    },
+  )
+
+  assert "PPO/action_std" in writer.scalars
+  assert "Action/joint_00_mean" in writer.scalars
+  assert "Action/joint_00_std" in writer.scalars
+  assert "Action/joint_00_abs_mean" in writer.scalars
+  assert "RewardTerms/tracking_lin_vel" in writer.scalars
+  assert "RewardTerms/action_rate" in writer.scalars
+  assert writer.scalars["RewardTerms/tracking_lin_vel"][0] == (1, 2.5)
+  assert writer.scalars["RewardTerms/action_rate"][0] == (1, -2.0)
+
+
 def test_wmp_runner_learn_save_load_with_fake_env(tmp_path: Path):
   expert_path = tmp_path / "amp_expert.txt"
   expert = torch.arange(8 * 60, dtype=torch.float32).reshape(8, 60)
