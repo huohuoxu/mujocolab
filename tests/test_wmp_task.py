@@ -29,6 +29,8 @@ from mjlab.tasks.WMP.rl.runner import WMPRunner
 
 TASK_ID = "Mjlab-WMP-Rough-Unitree-Go1"
 STAIRS_ONLY_TASK_ID = "Mjlab-WMP-Stairs-Only-Unitree-Go1"
+A1_TASK_ID = "Mjlab-WMP-Rough-Unitree-A1"
+A1_STAIRS_ONLY_TASK_ID = "Mjlab-WMP-Stairs-Only-Unitree-A1"
 
 
 def test_wmp_task_registered_and_cfg_serializable():
@@ -165,6 +167,41 @@ def test_wmp_stairs_only_task_registered_without_amp():
   assert play_cfg.scene.num_envs == len(terrain_names)
   assert "randomize_play_terrain" in play_cfg.events
   assert play_cfg.curriculum == {}
+
+
+def test_wmp_a1_tasks_registered_with_a1_action_scale_and_amp():
+  assert A1_TASK_ID in list_tasks()
+  assert A1_STAIRS_ONLY_TASK_ID in list_tasks()
+  assert load_runner_cls(A1_TASK_ID) is WMPRunner
+  assert load_runner_cls(A1_STAIRS_ONLY_TASK_ID) is WMPRunner
+
+  cfg = TrainConfig.from_task(A1_TASK_ID)
+
+  assert cfg.agent.experiment_name == "a1_wmp"
+  assert cfg.agent.run_name == "rough"
+  assert cfg.agent.amp.reward_scale == 0.01
+  assert cfg.agent.amp.updates_per_iteration == 1
+  assert cfg.agent.amp.expert_motion_files
+  assert cfg.agent.amp.expert_joint_pos_scale is None
+  assert cfg.agent.amp.expert_joint_pos_bias is None
+  assert cfg.env.actions["joint_pos"].scale == 0.25
+
+  robot_cfg = cfg.env.scene.entities["robot"]
+  assert robot_cfg.init_state.joint_pos["FR_hip_joint"] == -0.1
+  assert robot_cfg.init_state.joint_pos["FL_hip_joint"] == 0.1
+  assert robot_cfg.init_state.joint_pos["RR_thigh_joint"] == 1.0
+  assert robot_cfg.init_state.joint_pos[".*_calf_joint"] == -1.5
+
+  stairs_cfg = TrainConfig.from_task(A1_STAIRS_ONLY_TASK_ID)
+  assert stairs_cfg.agent.experiment_name == "a1_wmp"
+  assert stairs_cfg.agent.run_name == "stairs_only_amp"
+  assert stairs_cfg.agent.amp.expert_motion_files
+  assert stairs_cfg.agent.amp.reward_scale == 0.01
+  assert stairs_cfg.agent.amp.updates_per_iteration == 1
+  assert stairs_cfg.agent.amp.diagnostics_enabled
+  assert stairs_cfg.agent.amp.expert_joint_pos_scale is None
+  assert stairs_cfg.agent.amp.expert_joint_pos_bias is None
+  assert stairs_cfg.env.actions["joint_pos"].scale == 0.25
 
 
 def _quat_to_matrix(quat: tuple[float, float, float, float]) -> torch.Tensor:

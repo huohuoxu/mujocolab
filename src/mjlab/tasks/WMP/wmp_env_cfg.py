@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from typing import Callable
 
 from mjlab.asset_zoo.robots import GO1_ACTION_SCALE, get_go1_robot_cfg
+from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -125,6 +127,21 @@ def make_wmp_go1_env_cfg(
   play: bool = False,
   *,
   terrain_profile: str = "rough",
+) -> ManagerBasedRlEnvCfg:
+  return make_wmp_env_cfg(
+    play=play,
+    terrain_profile=terrain_profile,
+    robot_cfg_factory=get_go1_robot_cfg,
+    action_scale=GO1_ACTION_SCALE,
+  )
+
+
+def make_wmp_env_cfg(
+  play: bool = False,
+  *,
+  terrain_profile: str = "rough",
+  robot_cfg_factory: Callable[[], EntityCfg] = get_go1_robot_cfg,
+  action_scale: float | dict[str, float] = GO1_ACTION_SCALE,
 ) -> ManagerBasedRlEnvCfg:
   """创建 WMP + Go1 的完整 manager-based 环境配置
 
@@ -459,7 +476,7 @@ def make_wmp_go1_env_cfg(
     "joint_pos": JointPositionActionCfg(
       entity_name="robot",
       actuator_names=(".*",),
-      scale=GO1_ACTION_SCALE,
+      scale=action_scale,
       use_default_offset=True,
     )
   }
@@ -743,7 +760,7 @@ def make_wmp_go1_env_cfg(
       ),
       # 机器人本体来自 asset zoo
       # Go1 的 XML、执行器、默认姿态、site、collision geom 都在 unitree_go1 constants 中定义
-      entities={"robot": get_go1_robot_cfg()},
+      entities={"robot": robot_cfg_factory()},
       # 把上面声明的所有传感器挂到 scene
       # 传感器顺序不是语义 API，但集中列在这里便于核对依赖
       sensors=(

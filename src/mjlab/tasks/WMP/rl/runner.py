@@ -902,9 +902,9 @@ class WMPRunner:
     mean_abs = float(torch.mean(torch.abs(offset)))
     max_abs = float(torch.max(torch.abs(offset)))
     joint_names = tuple(getattr(robot, "joint_names", ()))[:12]
-    print("[WMP][AMP] Go1 joint order:", joint_names)
+    print("[WMP][AMP] Robot joint order:", joint_names)
     print(
-      "[WMP][AMP] Go1 default joint pos:",
+      "[WMP][AMP] Robot default joint pos:",
       self._format_vector(default_joint_pos),
     )
     print(
@@ -919,12 +919,12 @@ class WMPRunner:
       self._format_vector(motion_stats["std"][:12]),
     )
     print(
-      f"[WMP][AMP] Motion-Go1 default offset: mean_abs={mean_abs:.4f}, "
+      f"[WMP][AMP] Motion-robot default offset: mean_abs={mean_abs:.4f}, "
       f"max_abs={max_abs:.4f}"
     )
     if mean_abs > warn_mean or max_abs > warn_abs:
       print(
-        "[WMP][AMP][WARN] Expert motion joint distribution differs from Go1 "
+        "[WMP][AMP][WARN] Expert motion joint distribution differs from robot "
         "default posture; consider expert_joint_pos_bias/scale or retargeting "
         "if AMP reward/loss becomes abnormal."
       )
