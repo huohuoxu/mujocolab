@@ -338,11 +338,15 @@ def feet_edge(
   return reward * terrain_mask.float() * coef
 
 
-def only_positive_reward_clip(env: ManagerBasedRlEnv) -> torch.Tensor:
+def only_positive_reward_clip(
+  env: ManagerBasedRlEnv,
+  min_reward: float = 0.0,
+) -> torch.Tensor:
   manager = env.reward_manager
   dt = env.step_dt if getattr(manager, "_scale_by_dt", True) else 1.0
   previous = manager._reward_buf
-  correction = torch.clamp(previous, min=0.0) - previous
+  min_value = float(min_reward) * dt
+  correction = torch.clamp(previous, min=min_value) - previous
   return correction / dt
 
 

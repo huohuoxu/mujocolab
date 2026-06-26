@@ -57,6 +57,8 @@ class ActorCriticWMP(nn.Module):
     wm_latent_dim: int,
     command_dim: int,
     init_std: float,
+    min_std: float | None = None,
+    max_std: float | None = None,
     command_slice: tuple[int, int] = (6, 9),
   ) -> None:
     super().__init__()
@@ -66,6 +68,14 @@ class ActorCriticWMP(nn.Module):
     self.history_length = history_length
     self.command_dim = command_dim
     self.command_slice = command_slice
+    self.min_log_std = math.log(min_std) if min_std is not None else None
+    self.max_log_std = math.log(max_std) if max_std is not None else None
+    if (
+      self.min_log_std is not None
+      and self.max_log_std is not None
+      and self.min_log_std > self.max_log_std
+    ):
+      raise ValueError("min_std must be less than or equal to max_std.")
 
     self.history_encoder = build_mlp(
       actor_dim * history_length,
@@ -93,6 +103,14 @@ class ActorCriticWMP(nn.Module):
       activation,
     )
     self.log_std = nn.Parameter(torch.full((action_dim,), math.log(init_std)))
+
+  def _bounded_log_std(self) -> torch.Tensor:
+    log_std = self.log_std
+    if self.min_log_std is None and self.max_log_std is None:
+      return log_std
+    min_log_std = self.min_log_std
+    max_log_std = self.max_log_std
+    return torch.clamp(log_std, min=min_log_std, max=max_log_std)
 
   def _command(self, actor_obs: torch.Tensor) -> torch.Tensor:
     start, end = self.command_slice
@@ -122,7 +140,7 @@ class ActorCriticWMP(nn.Module):
   ) -> Normal:
     actor_input, _ = self._encode(actor_obs, history, wm_feature)
     mean = self.actor(actor_input)
-    std = torch.exp(self.log_std).expand_as(mean)
+    std = torch.exp(self._bounded_log_std()).expand_as(mean)
     return Normal(mean, std)
 
   def value(self, critic_obs: torch.Tensor, wm_feature: torch.Tensor) -> torch.Tensor:

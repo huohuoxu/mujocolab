@@ -129,10 +129,16 @@ def test_wmp_stairs_only_task_registered_without_amp():
 
   assert cfg.agent.class_name == "WMPRunner"
   assert cfg.agent.run_name == "stairs_only_no_amp"
+  assert cfg.agent.clip_actions == 2.0
+  assert cfg.agent.policy.init_std == 0.3
+  assert cfg.agent.policy.min_std == 0.05
+  assert cfg.agent.policy.max_std == 1.0
+  assert cfg.agent.algorithm.entropy_coef == 0.001
   assert cfg.agent.amp.expert_motion_files == ()
   assert cfg.agent.amp.reward_scale == 0.0
   assert cfg.agent.amp.updates_per_iteration == 0
   assert not cfg.agent.amp.diagnostics_enabled
+  assert cfg.env.rewards["only_positive_clip"].params["min_reward"] == -5.0
 
   terrain_cfg = cfg.env.scene.terrain.terrain_generator
   assert terrain_cfg is not None
@@ -504,6 +510,11 @@ def test_wmp_feet_edge_stumble_curriculum_and_clip_rewards():
   env.reward_manager = _FakeRewardManager(torch.tensor([-0.2, 0.3, -1.0, 0.0]))
   correction = mdp.only_positive_reward_clip(env)
   assert torch.allclose(correction * env.step_dt, torch.tensor([0.2, 0.0, 1.0, 0.0]))
+  correction = mdp.only_positive_reward_clip(env, min_reward=-0.5)
+  assert torch.allclose(
+    correction * env.step_dt,
+    torch.tensor([0.19, 0.0, 0.99, 0.0]),
+  )
 
 
 def test_wmp_motion_loader_reads_original_json_layout(tmp_path: Path):
@@ -587,7 +598,11 @@ def test_wmp_modules_shapes_and_losses_are_finite():
     wm_latent_dim=8,
     command_dim=3,
     init_std=0.5,
+    min_std=0.1,
+    max_std=0.6,
   )
+  with torch.no_grad():
+    actor_critic.log_std.fill_(2.0)
   world_model = SimpleWorldModel(
     prop_dim,
     action_dim,
@@ -613,6 +628,10 @@ def test_wmp_modules_shapes_and_losses_are_finite():
   depth = torch.randn(batch, depth_dim)
   height = torch.randn(batch, height_dim)
   wm_feature = world_model.features(prop)
+  assert torch.allclose(
+    torch.exp(actor_critic._bounded_log_std()),
+    torch.full((action_dim,), 0.6),
+  )
 
   sampled_action, log_prob, value = actor_critic.act(
     actor,

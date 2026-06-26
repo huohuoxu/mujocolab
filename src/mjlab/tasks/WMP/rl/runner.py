@@ -68,6 +68,8 @@ class WMPRunner:
       wm_latent_dim=int(policy_cfg.get("wm_latent_dim", 64)),
       command_dim=int(policy_cfg.get("command_dim", 3)),
       init_std=float(policy_cfg.get("init_std", 1.0)),
+      min_std=policy_cfg.get("min_std"),
+      max_std=policy_cfg.get("max_std"),
     ).to(self.device)
     self.world_model = SimpleWorldModel(
       prop_dim,
@@ -679,7 +681,7 @@ class WMPRunner:
     return "\n".join(lines)
 
   def _mean_action_std(self) -> float:
-    return float(torch.exp(self.actor_critic.log_std).mean().detach())
+    return float(torch.exp(self.actor_critic._bounded_log_std()).mean().detach())
 
   def _resolve_action_names(self, action_dim: int) -> tuple[str, ...]:
     try:

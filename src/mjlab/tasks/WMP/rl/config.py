@@ -32,6 +32,8 @@ class WmpPolicyCfg:
   wm_latent_dim: int = 64
   command_dim: int = 3
   init_std: float = 1.0
+  min_std: float | None = None
+  max_std: float | None = None
 
 
 @dataclass

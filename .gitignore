@@ -16,6 +16,7 @@ benchmark_results/
 skills/
 .uv-cache/
 .warp-cache/
+.tmp/
 
 # Documentation outputs.
 **/_build/*
