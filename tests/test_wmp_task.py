@@ -15,7 +15,7 @@ from mjlab.sensor import (
   ContactSensor,
   ContactSensorCfg,
 )
-from mjlab.tasks.registry import list_tasks, load_runner_cls
+from mjlab.tasks.registry import list_tasks, load_env_cfg, load_runner_cls
 from mjlab.tasks.WMP import mdp
 from mjlab.tasks.WMP.mdp.commands import WmpVelocityCommand, WmpVelocityCommandCfg
 from mjlab.tasks.WMP.rl.amp import MotionLoader
@@ -104,6 +104,20 @@ def test_wmp_task_registered_and_cfg_serializable():
   assert "feet_slip" not in cfg.env.rewards
   assert "thigh_collision" not in cfg.env.rewards
   assert "trunk_collision" not in cfg.env.rewards
+
+
+def test_wmp_play_randomizes_terrain_origin_before_base_reset():
+  cfg = load_env_cfg(TASK_ID, play=True)
+  reset_event_names = tuple(cfg.events)
+
+  assert "push_robot" not in cfg.events
+  assert cfg.scene.num_envs == len(cfg.scene.terrain.terrain_generator.sub_terrains)
+  assert "randomize_play_terrain" in cfg.events
+  assert reset_event_names.index("randomize_play_terrain") < reset_event_names.index(
+    "reset_base"
+  )
+  assert cfg.events["randomize_play_terrain"].func is mdp.randomize_play_terrain
+  assert cfg.curriculum == {}
 
 
 def _quat_to_matrix(quat: tuple[float, float, float, float]) -> torch.Tensor:
@@ -217,6 +231,45 @@ class _FakeTerrain:
     )
     self.metadata = metadata or {}
     self.cfg = _FakeTerrainCfg(terrain_generator)
+
+
+class _FakePlayEnv:
+  def __init__(self, num_envs: int, num_rows: int = 3, num_cols: int = 5) -> None:
+    self.num_envs = num_envs
+    self.device = "cpu"
+    terrain = type("Terrain", (), {})()
+    terrain.terrain_origins = torch.zeros(num_rows, num_cols, 3)
+    for row in range(num_rows):
+      for col in range(num_cols):
+        terrain.terrain_origins[row, col] = torch.tensor(
+          [float(row), float(col), 0.0]
+        )
+    terrain.terrain_levels = torch.zeros(num_envs, dtype=torch.long)
+    terrain.terrain_types = torch.zeros(num_envs, dtype=torch.long)
+    terrain.env_origins = torch.zeros(num_envs, 3)
+    self.scene = type("Scene", (), {"terrain": terrain})()
+
+
+def test_wmp_play_terrain_event_covers_types_and_rotates_single_env():
+  env = _FakePlayEnv(num_envs=5, num_rows=3, num_cols=5)
+
+  mdp.randomize_play_terrain(env, None)
+
+  assert set(env.scene.terrain.terrain_types.tolist()) == set(range(5))
+  assert torch.equal(
+    env.scene.terrain.env_origins,
+    env.scene.terrain.terrain_origins[
+      env.scene.terrain.terrain_levels, env.scene.terrain.terrain_types
+    ],
+  )
+
+  single_env = _FakePlayEnv(num_envs=1, num_rows=3, num_cols=5)
+  seen = []
+  for _ in range(5):
+    mdp.randomize_play_terrain(single_env, None)
+    seen.append(int(single_env.scene.terrain.terrain_types[0].item()))
+
+  assert len(set(seen)) == 5
 
 
 class _FakeScene:

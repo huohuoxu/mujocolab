@@ -432,8 +432,8 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       concatenate_terms=True,
       enable_corruption=False,
     ),
-    # AMP 观测是 discriminator 用来和 mocap transition 对比的状态向量。
-    # 这里保持无噪声，避免专家/策略判别信号被观测扰动污染。
+    # AMP 观测是 discriminator 用来和 mocap transition 对比的状态向量
+    # 这里保持无噪声，避免专家/策略判别信号被观测扰动污染
     "amp": ObservationGroupCfg(
       terms={"amp": ObservationTermCfg(func=mdp.amp_observation)},
       concatenate_terms=True,
@@ -444,10 +444,9 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # ---------------------------------------------------------------------------
   # 3. Actions and commands：动作和命令
   # ---------------------------------------------------------------------------
-  # 策略输出的是归一化动作。JointPositionActionCfg 会把动作映射为 Go1
-  # 关节位置目标，大致形式为：
+  # 策略输出的是归一化动作，JointPositionActionCfg 会把动作映射为 Go1 关节位置目标，形式为：
   #   target = default_joint_pos + action * GO1_ACTION_SCALE
-  # 其中 GO1_ACTION_SCALE 来自资产库，会按不同关节/执行器尺度设置动作幅度。
+  #   其中 GO1_ACTION_SCALE 来自资产库，会按不同关节/执行器尺度设置动作幅度
   actions: dict[str, ActionTermCfg] = {
     "joint_pos": JointPositionActionCfg(
       entity_name="robot",
@@ -457,9 +456,8 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
   }
 
-  # `twist` 是本任务追踪的速度命令，会同时进入 actor/critic 观测和速度奖励。
-  # WMP 自定义 command term 支持 obstacle terrain 与 rough-flat terrain 使用
-  # 不同采样范围，更贴近原始 WMP 的命令语义。
+  # twist 是本任务追踪的速度命令，会同时进入 actor/critic 观测和速度奖励
+  # WMP 自定义 command term 支持 obstacle terrain 与 rough-flat terrain 使用不同采样范围，更贴近原始 WMP 的命令语义
   commands: dict[str, CommandTermCfg] = {
     "twist": WmpVelocityCommandCfg(
       entity_name="robot",
@@ -489,9 +487,9 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # 4. Events：reset 逻辑和 domain randomization
   # ---------------------------------------------------------------------------
   # EventManager 负责执行这些事件：
-  # - mode="reset"：每次环境 reset 时执行。
-  # - mode="interval"：训练过程中按时间间隔执行。
-  # - mode="startup"：manager 创建后执行一次，常用于域随机化。
+  # - mode="reset"：每次环境 reset 时执行的事件
+  # - mode="interval"：训练过程中按时间间隔执行的事件
+  # - mode="startup"：manager 创建后执行一次，常用于域随机化
   events = {
     # reset 时随机化 base 初始位姿；velocity_range 为空表示速度保持默认值。
     "reset_base": EventTermCfg(
@@ -507,7 +505,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "velocity_range": {},
       },
     ),
-    # 每个 episode 从机器人默认关节姿态和零关节速度开始。
+    # 每个 episode 从机器人默认关节姿态和零关节速度开始
     "reset_robot_joints": EventTermCfg(
       func=mdp.reset_joints_by_offset,
       mode="reset",
@@ -517,8 +515,8 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
       },
     ),
-    # 随机外部速度扰动，用于提升鲁棒性。play 模式下会移除它，
-    # 这样可视化评估时更容易判断策略本身表现。
+    # 随机外部速度扰动，用于提升鲁棒性
+    # play 模式下会移除它，这样可视化评估时更容易判断策略本身表现。
     "push_robot": EventTermCfg(
       func=mdp.push_by_setting_velocity,
       mode="interval",
@@ -534,8 +532,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
       },
     ),
-    # startup 域随机化：为每个环境采样足端摩擦系数。
-    # 这样策略不会过度依赖某一个固定接触参数。
+    # startup 域随机化：为每个环境采样足端摩擦系数，这样策略不会过度依赖某一个固定接触参数
     "foot_friction": EventTermCfg(
       mode="startup",
       func=dr.geom_friction,
@@ -547,8 +544,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "shared_random": True,
       },
     ),
-    # startup 域随机化：扰动 trunk 质心位置。
-    # 这是应对质量分布误差的一个简单鲁棒性开关。
+    # startup 域随机化：扰动 trunk 质心位置，这是应对质量分布误差的一个简单鲁棒性开关
     "base_com": EventTermCfg(
       mode="startup",
       func=dr.body_com_offset,
@@ -567,26 +563,26 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # ---------------------------------------------------------------------------
   # 5. Rewards：奖励项
   # ---------------------------------------------------------------------------
-  # RewardManager 会逐项计算 reward term，乘以各自 weight，并默认按 env.step_dt
-  # 缩放。正奖励主要鼓励速度追踪和合理步态；负奖励抑制不稳定、低效、
-  # 碰撞、卡住和利用地形漏洞等行为。
+  # RewardManager 会逐项计算 reward term，乘以各自 weight，并默认按 env.step_dt缩放
+  # 正奖励主要鼓励速度追踪和合理步态
+  # 负奖励抑制不稳定、低效、碰撞、卡住和利用地形漏洞等行为
   rewards = {
-    # 追踪 base 坐标系下的线速度命令，主要是前进速度。
+    # 追踪 base 坐标系下的线速度命令，主要是前进速度
     "tracking_lin_vel": RewardTermCfg(
       func=mdp.track_linear_velocity,
       weight=1.5,
       params={"command_name": "twist", "std": 0.15},
     ),
-    # 追踪 yaw 角速度命令，或者 heading controller 生成的 yaw 速度目标。
+    # 追踪 yaw 角速度命令，或者 heading controller 生成的 yaw 速度目标
     "tracking_ang_vel": RewardTermCfg(
       func=mdp.track_angular_velocity,
       weight=0.5,
       params={"command_name": "twist", "std": 0.15},
     ),
-    # 抑制 base 垂直方向速度，减少上下弹跳。
+    # 抑制 base 垂直方向速度，减少上下弹跳
     "lin_vel_z": RewardTermCfg(func=mdp.lin_vel_z_l2, weight=-1.0),
-    # 抑制执行器力矩、关节加速度、动作变化和关节偏离默认姿态。
-    # 这些项共同让步态更平滑，也更接近硬件可承受的控制信号。
+    # 抑制执行器力矩、关节加速度、动作变化和关节偏离默认姿态
+    # 这些项共同让步态更平滑，也更接近硬件可承受的控制信号
     "torques": RewardTermCfg(
       func=mdp.torques_l2,
       weight=-1.0e-4,
@@ -595,13 +591,13 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     "dof_acc": RewardTermCfg(func=mdp.dof_acc_l2, weight=-2.5e-7),
     "action_rate": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.03),
     "dof_error": RewardTermCfg(func=mdp.dof_error_l2, weight=-0.04),
-    # 当存在移动命令时，鼓励合理的摆腿/离地时间。
+    # 当存在移动命令时，鼓励合理的摆腿/离地时间
     "feet_air_time": RewardTermCfg(
       func=mdp.feet_air_time,
       weight=0.5,
       params={"sensor_name": "feet_ground_contact", "command_name": "twist"},
     ),
-    # 惩罚大腿/小腿等非足端链接与地形接触。
+    # 惩罚大腿/小腿等非足端链接与地形接触
     "collision": RewardTermCfg(
       func=mdp.collision_cost,
       weight=-1.0,
@@ -610,14 +606,14 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "force_threshold": 0.1,
       },
     ),
-    # 惩罚足端在障碍地形上的侧向绊倒式接触。
+    # 惩罚足端在障碍地形上的侧向绊倒式接触
     "feet_stumble": RewardTermCfg(
       func=mdp.feet_stumble,
       weight=-0.1,
       params={"sensor_name": "feet_ground_contact"},
     ),
-    # 惩罚脚直接踩在障碍边缘上。地形生成器会保存 edge metadata，
-    # 这个 reward 读取这些 metadata，并叠加课程系数。
+    # 惩罚脚直接踩在障碍边缘上
+    # 地形生成器会保存 edge metadata，这个 reward 读取这些 metadata，并叠加课程系数
     "feet_edge": RewardTermCfg(
       func=mdp.feet_edge,
       weight=-1.0,
@@ -627,16 +623,16 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       },
     ),
     # 任务特定的反作弊/反投机项：
-    # - cheat：避免策略利用 rough-flat 地形绕开障碍语义。
-    # - stuck：有前进命令时不能原地不动。
+    # - cheat：避免策略利用 rough-flat 地形绕开障碍语义
+    # - stuck：有前进命令时不能原地不动
     "cheat": RewardTermCfg(func=mdp.cheat, weight=-1.0),
     "stuck": RewardTermCfg(
       func=mdp.stuck,
       weight=-1.0,
       params={"command_name": "twist"},
     ),
-    # 在 reward 函数层把总奖励裁剪到非负范围。
-    # 这是很多 locomotion 任务常见的 reward shaping 技巧。
+    # 在 reward 函数层把总奖励裁剪到非负范围
+    # 这是很多 locomotion 任务常见的 reward shaping 技巧
     "only_positive_clip": RewardTermCfg(
       func=mdp.only_positive_reward_clip,
       weight=1.0,
@@ -646,16 +642,16 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # ---------------------------------------------------------------------------
   # 6. Terminations：终止/截断条件
   # ---------------------------------------------------------------------------
-  # TerminationManager 会返回两类 mask：terminated 和 time_out/truncated。
-  # `time_out=True` 表示这是人为截断或时间限制，不一定是任务失败。
+  # TerminationManager 会返回两类 mask：terminated 和 time_out/truncated
+  # time_out=True 表示这是人为截断或时间限制，不一定是任务失败
   terminations = {
     "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
-    # trunk/head 碰到地形是真失败，因为这通常意味着机身撞地或摔倒。
+    # trunk/head 碰到地形是真失败，因为这通常意味着机身撞地或摔倒
     "base_contact": TerminationTermCfg(
       func=mdp.illegal_contact,
       params={"sensor_name": "trunk_ground_touch"},
     ),
-    # 离开生成地形边界按 timeout 风格处理，而不是物理失败信号。
+    # 离开生成地形边界按 timeout 风格处理，而不是物理失败信号
     "out_of_terrain_bounds": TerminationTermCfg(
       func=mdp.out_of_terrain_bounds,
       time_out=True,
@@ -666,8 +662,8 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # 7. Curriculum and metrics：课程学习和指标
   # ---------------------------------------------------------------------------
   # Curriculum term 会在 reset 流程中执行。WMP 这里主要做两件事：
-  # - 根据机器人在地形块上的前进情况调整 terrain level。
-  # - 训练到一定环境步数后扩大速度命令范围。
+  # - 根据机器人在地形块上的前进情况调整 terrain level
+  # - 训练到一定环境步数后扩大速度命令范围
   curriculum = {
     "terrain_levels": CurriculumTermCfg(
       func=mdp.terrain_levels_wmp,
@@ -686,18 +682,26 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
   }
 
-  # MetricsManager 额外记录的自定义标量，主要用于日志和调试。
+  # MetricsManager 额外记录的自定义标量，主要用于日志和调试
   metrics = {
     "mean_action_acc": MetricsTermCfg(
       func=mdp.mean_action_acc,
     )
   }
 
-  # play 模式使用独立地形集合，关闭随机推扰，并冻结课程学习。
-  # 这样可视化时环境变化更少，方便判断策略是否真的会走。
+  # play 模式使用独立地形集合，关闭随机推扰，并冻结课程学习
+  # 这样可视化时环境变化更少，方便判断策略是否真的会走
   terrain_cfg = WMP_PLAY_TERRAINS_CFG if play else WMP_ROUGH_TERRAINS_CFG
   if play:
     events.pop("push_robot", None)
+    events = {
+      "randomize_play_terrain": EventTermCfg(
+        func=mdp.randomize_play_terrain,
+        mode="reset",
+        params={"cover_terrain_types": True},
+      ),
+      **events,
+    }
     curriculum = {}
 
   # ---------------------------------------------------------------------------
@@ -707,18 +711,18 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # 构建 Scene、Simulation，以及各类 manager。
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
-      # 使用 WMP terrain preset 生成程序化地形。`replace()` 用来复制配置，
-      # 避免不同注册任务副本共享同一个可变 terrain generator 对象。
+      # 使用 WMP terrain preset 生成程序化地形。
+      # replace() 用来复制配置，避免不同注册任务副本共享同一个可变 terrain generator 对象
       terrain=TerrainEntityCfg(
         terrain_type="generator",
         terrain_generator=replace(terrain_cfg),
         max_init_terrain_level=0,
       ),
-      # 机器人本体来自 asset zoo。Go1 的 XML、执行器、默认姿态、site 和
-      # collision geom 都在 unitree_go1 constants 中定义。
+      # 机器人本体来自 asset zoo
+      # Go1 的 XML、执行器、默认姿态、site、collision geom 都在 unitree_go1 constants 中定义
       entities={"robot": get_go1_robot_cfg()},
-      # 把上面声明的所有传感器挂到 scene。传感器顺序不是语义 API，
-      # 但集中列在这里便于核对依赖。
+      # 把上面声明的所有传感器挂到 scene
+      # 传感器顺序不是语义 API，但集中列在这里便于核对依赖
       sensors=(
         terrain_scan,
         forward_scan,
@@ -729,7 +733,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         shank_contact,
         trunk_contact,
       ),
-      num_envs=1,
+      num_envs=len(terrain_cfg.sub_terrains) if play else 1,
       extent=2.0,
     ),
     observations=observations,
@@ -740,7 +744,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     terminations=terminations,
     curriculum=curriculum,
     metrics=metrics,
-    # viewer 跟随 trunk，这样 native/viser 播放时机器人会保持在视野中心附近。
+    # viewer 跟随 trunk，这样 native/viser 播放时机器人会保持在视野中心附近
     viewer=ViewerConfig(
       origin_type=ViewerConfig.OriginType.ASSET_BODY,
       entity_name="robot",
@@ -750,7 +754,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       azimuth=90.0,
     ),
     # MuJoCo 求解器和接触相关设置。环境控制周期为：
-    #   timestep * decimation = 0.005 * 4 = 0.02 s
+    # timestep * decimation = 0.005 * 4 = 0.02 s
     # 也就是策略以 50 Hz 频率输出动作。
     sim=SimulationCfg(
       nconmax=80,
@@ -765,7 +769,7 @@ def make_wmp_go1_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         impratio=10,
       ),
     ),
-    # 每个动作对应 4 个物理子步；每个 episode 最长 20 秒。
+    # 每个动作对应 4 个物理子步；每个 episode 最长 20 秒
     decimation=4,
     episode_length_s=20.0,
   )

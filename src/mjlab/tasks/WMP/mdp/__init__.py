@@ -4,6 +4,7 @@ from mjlab.envs.mdp.events import reset_root_state_uniform as reset_root_state_u
 from mjlab.tasks.WMP.mdp.commands import WmpVelocityCommandCfg as WmpVelocityCommandCfg
 from mjlab.tasks.WMP.mdp.curriculums import commands_vel as commands_vel
 from mjlab.tasks.WMP.mdp.curriculums import terrain_levels_wmp as terrain_levels_wmp
+from mjlab.tasks.WMP.mdp.events import randomize_play_terrain as randomize_play_terrain
 from mjlab.tasks.WMP.mdp.metrics import mean_action_acc as mean_action_acc
 from mjlab.tasks.WMP.mdp.observations import amp_observation as amp_observation
 from mjlab.tasks.WMP.mdp.observations import base_ang_vel as base_ang_vel
