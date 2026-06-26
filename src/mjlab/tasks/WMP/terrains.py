@@ -292,11 +292,11 @@ WMP_STAIRS_ONLY_TERRAINS_CFG = TerrainGeneratorCfg(
   size=(8.0, 8.0),
   border_width=25.0,
   num_rows=10,
-  num_cols=6,
+  num_cols=2,
   curriculum=True,
   sub_terrains={
-    **_terrain_columns("stairs_up", _WMP_STAIRS_UP_CFG, 3),
-    **_terrain_columns("stairs_down", _WMP_STAIRS_DOWN_CFG, 3),
+    "stairs_up_0": replace(_WMP_STAIRS_UP_CFG, proportion=1.0),
+    "stairs_down_0": replace(_WMP_STAIRS_DOWN_CFG, proportion=1.0),
   },
   add_lights=True,
 )

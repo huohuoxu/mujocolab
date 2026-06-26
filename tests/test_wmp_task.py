@@ -139,14 +139,10 @@ def test_wmp_stairs_only_task_registered_without_amp():
   terrain_names = tuple(terrain_cfg.sub_terrains)
   assert terrain_cfg.curriculum
   assert terrain_cfg.num_rows == 10
-  assert terrain_cfg.num_cols == 6
+  assert terrain_cfg.num_cols == 2
   assert terrain_names == (
     "stairs_up_0",
-    "stairs_up_1",
-    "stairs_up_2",
     "stairs_down_0",
-    "stairs_down_1",
-    "stairs_down_2",
   )
 
   play_cfg = load_env_cfg(STAIRS_ONLY_TASK_ID, play=True)
