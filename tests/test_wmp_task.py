@@ -19,6 +19,7 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg, load_runner_cls
 from mjlab.tasks.WMP import mdp
 from mjlab.tasks.WMP.mdp.commands import WmpVelocityCommand, WmpVelocityCommandCfg
 from mjlab.tasks.WMP.rl.amp import MotionLoader
+from mjlab.tasks.WMP.rl.amp import AMPDiscriminator
 from mjlab.tasks.WMP.rl.modules import (
   ActorCriticWMP,
   DepthPredictor,
@@ -129,16 +130,22 @@ def test_wmp_stairs_only_task_registered_without_amp():
 
   assert cfg.agent.class_name == "WMPRunner"
   assert cfg.agent.run_name == "stairs_only_no_amp"
-  assert cfg.agent.clip_actions == 2.0
-  assert cfg.agent.policy.init_std == 0.3
-  assert cfg.agent.policy.min_std == 0.05
-  assert cfg.agent.policy.max_std == 1.0
-  assert cfg.agent.algorithm.entropy_coef == 0.001
+  assert cfg.agent.clip_actions == 6.0
+  assert cfg.agent.policy.init_std == 1.0
+  assert cfg.agent.policy.min_std is None
+  assert cfg.agent.policy.max_std is None
+  assert cfg.agent.policy.history_exclude_command
+  assert cfg.agent.policy.clip_observations == 100.0
+  assert cfg.agent.algorithm.entropy_coef == 0.01
+  assert cfg.agent.algorithm.use_clipped_value_loss
+  assert cfg.agent.algorithm.schedule == "adaptive"
+  assert cfg.agent.algorithm.desired_kl == 0.01
+  assert cfg.agent.algorithm.vel_predict_coef == 1.0
   assert cfg.agent.amp.expert_motion_files == ()
   assert cfg.agent.amp.reward_scale == 0.0
   assert cfg.agent.amp.updates_per_iteration == 0
   assert not cfg.agent.amp.diagnostics_enabled
-  assert cfg.env.rewards["only_positive_clip"].params["min_reward"] == -5.0
+  assert cfg.env.rewards["only_positive_clip"].params == {}
 
   terrain_cfg = cfg.env.scene.terrain.terrain_generator
   assert terrain_cfg is not None
@@ -575,6 +582,22 @@ def test_wmp_motion_loader_joint_stats_and_bias_scale(tmp_path: Path):
   assert torch.allclose(stats["mean"], (expected_first + expected_second) * 0.5)
 
 
+def test_wmp_amp_discriminator_reward_matches_original_quadratic_formula():
+  disc = AMPDiscriminator(amp_obs_dim=30, hidden_dims=(16,))
+  transitions = torch.zeros(4, 60)
+  amp_obs = transitions[:, :30]
+  next_amp_obs = transitions[:, 30:]
+
+  class _ConstantNet(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+      return torch.ones(x.shape[0], 1, device=x.device) * 1.0
+
+  disc.net = _ConstantNet()
+  reward = disc.reward(amp_obs, next_amp_obs, reward_scale=0.01)
+
+  assert torch.allclose(reward, torch.full((4,), 0.01))
+
+
 def test_wmp_modules_shapes_and_losses_are_finite():
   batch = 4
   actor_dim = 45
@@ -590,6 +613,7 @@ def test_wmp_modules_shapes_and_losses_are_finite():
     actor_dim,
     critic_dim,
     action_dim,
+    history_dim=42,
     history_length=3,
     hidden_dims=hidden_dims,
     activation="elu",
@@ -619,7 +643,7 @@ def test_wmp_modules_shapes_and_losses_are_finite():
 
   actor = torch.randn(batch, actor_dim)
   critic = torch.randn(batch, critic_dim)
-  history = torch.randn(batch, 3, actor_dim)
+  history = torch.randn(batch, 3, 42)
   prop = torch.randn(batch, prop_dim)
   next_prop = torch.randn(batch, prop_dim)
   actions = torch.randn(batch, action_dim)
@@ -642,6 +666,7 @@ def test_wmp_modules_shapes_and_losses_are_finite():
   assert sampled_action.shape == (batch, action_dim)
   assert log_prob.shape == (batch,)
   assert value.shape == (batch,)
+  assert actor_critic.predict_linear_velocity(history).shape == (batch, 3)
 
   loss, losses = world_model.loss(
     prop,
@@ -755,6 +780,8 @@ def _tiny_runner_cfg(expert_motion_files: tuple[str, ...] = ()) -> dict:
       "hidden_dims": (16,),
       "activation": "elu",
       "history_length": 2,
+      "history_exclude_command": True,
+      "clip_observations": 100.0,
       "history_latent_dim": 8,
       "wm_feature_dim": 16,
       "wm_latent_dim": 8,
@@ -765,11 +792,15 @@ def _tiny_runner_cfg(expert_motion_files: tuple[str, ...] = ()) -> dict:
       "num_learning_epochs": 1,
       "num_mini_batches": 1,
       "learning_rate": 1.0e-3,
+      "schedule": "adaptive",
+      "desired_kl": 0.01,
       "gamma": 0.99,
       "lam": 0.95,
       "clip_param": 0.2,
       "entropy_coef": 0.0,
       "value_loss_coef": 1.0,
+      "use_clipped_value_loss": True,
+      "vel_predict_coef": 1.0,
       "max_grad_norm": 1.0,
       "amp_task_reward_lerp": 0.3,
     },
@@ -825,6 +856,7 @@ def test_wmp_runner_logs_action_std_action_stats_and_reward_terms():
     _tiny_runner_cfg(()),
     device="cpu",
   )
+  assert runner.history_dim == 42
   writer = _FakeWriter()
   runner._writer = writer
   actions = torch.arange(2 * env.num_envs * env.num_actions, dtype=torch.float32)
@@ -862,6 +894,7 @@ def test_wmp_runner_logs_action_std_action_stats_and_reward_terms():
   )
 
   assert "PPO/action_std" in writer.scalars
+  assert "Action/max_abs_mean" in writer.scalars
   assert "Action/joint_00_mean" in writer.scalars
   assert "Action/joint_00_std" in writer.scalars
   assert "Action/joint_00_abs_mean" in writer.scalars

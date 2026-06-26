@@ -8,6 +8,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from torch import autograd
 from torch import nn
 from torch.nn import functional as F
 
@@ -239,6 +240,24 @@ class AMPDiscriminator(nn.Module):
   def logits(self, transitions: torch.Tensor) -> torch.Tensor:
     return self.net(transitions).squeeze(-1)
 
+  def compute_grad_penalty(
+    self,
+    expert_transitions: torch.Tensor,
+    *,
+    weight: float = 10.0,
+  ) -> torch.Tensor:
+    expert_transitions = expert_transitions.detach().requires_grad_(True)
+    disc = self.logits(expert_transitions)
+    grad = autograd.grad(
+      outputs=disc,
+      inputs=expert_transitions,
+      grad_outputs=torch.ones_like(disc),
+      create_graph=True,
+      retain_graph=True,
+      only_inputs=True,
+    )[0]
+    return weight * grad.norm(2, dim=1).square().mean()
+
   def reward(
     self,
     amp_obs: torch.Tensor,
@@ -247,30 +266,36 @@ class AMPDiscriminator(nn.Module):
     reward_scale: float,
   ) -> torch.Tensor:
     transitions = torch.cat((amp_obs, next_amp_obs), dim=-1)
-    prob_expert = torch.sigmoid(self.logits(transitions))
-    reward = -torch.log(torch.clamp(1.0 - prob_expert, min=1.0e-4))
-    return reward_scale * torch.clamp(reward, max=10.0)
+    disc = self.logits(transitions)
+    reward = torch.clamp(1.0 - 0.25 * torch.square(disc - 1.0), min=0.0)
+    return reward_scale * reward
 
   def loss(
     self, policy_transitions: torch.Tensor, expert_transitions: torch.Tensor
   ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     policy_logits = self.logits(policy_transitions)
     expert_logits = self.logits(expert_transitions)
-    policy_loss = F.binary_cross_entropy_with_logits(
+    policy_loss = F.mse_loss(
       policy_logits,
-      torch.zeros_like(policy_logits),
+      -torch.ones_like(policy_logits),
     )
-    expert_loss = F.binary_cross_entropy_with_logits(
+    expert_loss = F.mse_loss(
       expert_logits,
       torch.ones_like(expert_logits),
     )
-    loss = 0.5 * (policy_loss + expert_loss)
+    amp_loss = 0.5 * (policy_loss + expert_loss)
+    grad_penalty = self.compute_grad_penalty(expert_transitions, weight=10.0)
+    loss = amp_loss + grad_penalty
     with torch.no_grad():
       policy_acc = (policy_logits < 0.0).float().mean()
       expert_acc = (expert_logits > 0.0).float().mean()
     return loss, {
       "policy_acc": policy_acc,
       "expert_acc": expert_acc,
+      "amp_loss": amp_loss.detach(),
+      "grad_penalty": grad_penalty.detach(),
+      "policy_pred": policy_logits.mean().detach(),
+      "expert_pred": expert_logits.mean().detach(),
       "policy_loss": policy_loss.detach(),
       "expert_loss": expert_loss.detach(),
     }

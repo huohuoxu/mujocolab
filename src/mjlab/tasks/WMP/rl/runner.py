@@ -41,6 +41,7 @@ class WMPRunner:
     world_cfg = train_cfg.get("world_model", {})
     depth_cfg = train_cfg.get("depth_predictor", {})
     amp_cfg = train_cfg.get("amp", {})
+    self.clip_observations = float(policy_cfg.get("clip_observations", 100.0))
 
     obs = env.get_observations()
     tensors = self._obs_to_tensors(obs)
@@ -53,6 +54,12 @@ class WMPRunner:
     action_dim = env.num_actions
 
     history_length = int(policy_cfg.get("history_length", 5))
+    self.history_exclude_command = bool(
+      policy_cfg.get("history_exclude_command", True)
+    )
+    self.command_dim = int(policy_cfg.get("command_dim", 3))
+    self.command_slice = self._resolve_command_slice(actor_dim, self.command_dim)
+    history_dim = self._actor_history_obs(tensors["actor"]).shape[-1]
     wm_feature_dim = int(
       world_cfg.get("feature_dim", policy_cfg.get("wm_feature_dim", 128))
     )
@@ -60,16 +67,18 @@ class WMPRunner:
       actor_dim,
       critic_dim,
       action_dim,
+      history_dim=history_dim,
       history_length=history_length,
       hidden_dims=tuple(policy_cfg.get("hidden_dims", (512, 256, 128))),
       activation=policy_cfg.get("activation", "elu"),
       history_latent_dim=int(policy_cfg.get("history_latent_dim", 128)),
       wm_feature_dim=wm_feature_dim,
       wm_latent_dim=int(policy_cfg.get("wm_latent_dim", 64)),
-      command_dim=int(policy_cfg.get("command_dim", 3)),
+      command_dim=self.command_dim,
       init_std=float(policy_cfg.get("init_std", 1.0)),
       min_std=policy_cfg.get("min_std"),
       max_std=policy_cfg.get("max_std"),
+      command_slice=self.command_slice,
     ).to(self.device)
     self.world_model = SimpleWorldModel(
       prop_dim,
@@ -126,7 +135,13 @@ class WMPRunner:
 
     self.history_length = history_length
     self.actor_dim = actor_dim
-    self._history = tensors["actor"].unsqueeze(1).repeat(1, history_length, 1)
+    self.history_dim = history_dim
+    self.learning_rate = float(alg_cfg.get("learning_rate", 1.0e-3))
+    self._history = (
+      self._actor_history_obs(tensors["actor"])
+      .unsqueeze(1)
+      .repeat(1, history_length, 1)
+    )
     self.depth_update_interval = max(1, int(depth_cfg.get("camera_update_interval", 5)))
     self.num_camera_envs = min(
       self.num_envs, int(depth_cfg.get("camera_num_envs", self.num_envs))
@@ -163,7 +178,11 @@ class WMPRunner:
 
     obs = self.env.get_observations()
     tensors = self._obs_to_tensors(obs)
-    self._history = tensors["actor"].unsqueeze(1).repeat(1, self.history_length, 1)
+    self._history = (
+      self._actor_history_obs(tensors["actor"])
+      .unsqueeze(1)
+      .repeat(1, self.history_length, 1)
+    )
     start = self.current_learning_iteration
     end = start + num_learning_iterations
     total_steps = (
@@ -223,8 +242,11 @@ class WMPRunner:
       "history": [],
       "wm_feature": [],
       "actions": [],
+      "action_mean": [],
+      "action_std": [],
       "log_prob": [],
       "values": [],
+      "base_lin_vel": [],
       "rewards": [],
       "task_rewards": [],
       "reward_terms": [],
@@ -246,6 +268,11 @@ class WMPRunner:
         actions, log_prob, values = self.actor_critic.act(
           tensors["actor"],
           tensors["critic"],
+          self._history,
+          wm_feature,
+        )
+        action_mean, action_std = self.actor_critic.distribution_stats(
+          tensors["actor"],
           self._history,
           wm_feature,
         )
@@ -273,8 +300,13 @@ class WMPRunner:
       storage["history"].append(self._history.clone())
       storage["wm_feature"].append(wm_feature.detach())
       storage["actions"].append(actions.detach())
+      storage["action_mean"].append(action_mean.detach())
+      storage["action_std"].append(action_std.detach())
       storage["log_prob"].append(log_prob.detach())
       storage["values"].append(values.detach())
+      storage["base_lin_vel"].append(
+        self._critic_linear_velocity_target(tensors["critic"]).detach()
+      )
       storage["rewards"].append(rewards.detach())
       storage["task_rewards"].append(task_rewards.detach())
       storage["reward_terms"].append(reward_terms)
@@ -330,12 +362,37 @@ class WMPRunner:
     return self._depth_cache.detach().clone(), raw_depth, real_mask
 
   def _push_history(self, actor_obs: torch.Tensor, dones: torch.Tensor) -> None:
+    history_obs = self._actor_history_obs(actor_obs)
     self._history = torch.roll(self._history, shifts=-1, dims=1)
-    self._history[:, -1, :] = actor_obs
+    self._history[:, -1, :] = history_obs
     if dones.any():
       self._history[dones] = (
-        actor_obs[dones].unsqueeze(1).repeat(1, self.history_length, 1)
+        history_obs[dones].unsqueeze(1).repeat(1, self.history_length, 1)
       )
+
+  def _resolve_command_slice(
+    self,
+    actor_dim: int,
+    command_dim: int,
+  ) -> tuple[int, int]:
+    start = 6
+    end = start + command_dim
+    if actor_dim >= end:
+      return start, end
+    return actor_dim, actor_dim
+
+  def _actor_history_obs(self, actor_obs: torch.Tensor) -> torch.Tensor:
+    if not self.history_exclude_command:
+      return actor_obs
+    start, end = self.command_slice
+    if start == end:
+      return actor_obs
+    return torch.cat((actor_obs[:, :start], actor_obs[:, end:]), dim=-1)
+
+  def _critic_linear_velocity_target(self, critic_obs: torch.Tensor) -> torch.Tensor:
+    if critic_obs.shape[-1] < 3:
+      return torch.zeros(critic_obs.shape[0], 3, device=critic_obs.device)
+    return critic_obs[:, :3]
 
   def _compute_returns(
     self,
@@ -369,12 +426,20 @@ class WMPRunner:
     flat = {
       "actor": rollout["actor"].reshape(batch, -1),
       "critic": rollout["critic"].reshape(batch, -1),
-      "history": rollout["history"].reshape(batch, self.history_length, self.actor_dim),
+      "history": rollout["history"].reshape(
+        batch,
+        self.history_length,
+        self.history_dim,
+      ),
       "wm_feature": rollout["wm_feature"].reshape(batch, -1),
       "actions": rollout["actions"].reshape(batch, -1),
+      "old_action_mean": rollout["action_mean"].reshape(batch, -1),
+      "old_action_std": rollout["action_std"].reshape(batch, -1),
       "old_log_prob": rollout["log_prob"].reshape(batch),
       "returns": returns.reshape(batch),
       "advantages": advantages.reshape(batch),
+      "values": rollout["values"].reshape(batch),
+      "base_lin_vel": rollout["base_lin_vel"].reshape(batch, 3),
     }
     cfg = self.cfg["algorithm"]
     num_epochs = int(cfg.get("num_learning_epochs", 5))
@@ -383,11 +448,19 @@ class WMPRunner:
     clip_param = float(cfg.get("clip_param", 0.2))
     value_coef = float(cfg.get("value_loss_coef", 1.0))
     entropy_coef = float(cfg.get("entropy_coef", 0.01))
+    vel_predict_coef = float(cfg.get("vel_predict_coef", 1.0))
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
+    use_clipped_value_loss = bool(cfg.get("use_clipped_value_loss", True))
+    schedule = str(cfg.get("schedule", "adaptive"))
+    desired_kl = cfg.get("desired_kl", 0.01)
+    desired_kl = None if desired_kl is None else float(desired_kl)
     stats = {
       "policy_loss": 0.0,
       "value_loss": 0.0,
+      "vel_predict_loss": 0.0,
       "entropy": 0.0,
+      "kl_mean": 0.0,
+      "learning_rate": self.learning_rate,
     }
     updates = 0
     for _ in range(num_epochs):
@@ -405,6 +478,29 @@ class WMPRunner:
         if cfg.get("normalize_advantage_per_mini_batch", False):
           adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1.0e-8)
         ratio = torch.exp(new_log_prob - flat["old_log_prob"][mb])
+        with torch.no_grad():
+          new_mean, new_std = self.actor_critic.distribution_stats(
+            flat["actor"][mb],
+            flat["history"][mb],
+            flat["wm_feature"][mb],
+          )
+          old_mean = flat["old_action_mean"][mb]
+          old_std = flat["old_action_std"][mb]
+          kl = torch.sum(
+            torch.log(new_std / old_std + 1.0e-5)
+            + (old_std.square() + (old_mean - new_mean).square())
+            / (2.0 * new_std.square())
+            - 0.5,
+            dim=-1,
+          )
+          kl_mean = torch.mean(kl)
+          if desired_kl is not None and schedule == "adaptive":
+            if kl_mean > desired_kl * 2.0:
+              self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
+            elif 0.0 < kl_mean < desired_kl / 2.0:
+              self.learning_rate = min(1.0e-2, self.learning_rate * 1.5)
+            for param_group in self.optimizer.param_groups:
+              param_group["lr"] = self.learning_rate
         surrogate = ratio * adv
         surrogate_clipped = (
           torch.clamp(
@@ -415,15 +511,35 @@ class WMPRunner:
           * adv
         )
         policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
-        value_loss = F.mse_loss(value, flat["returns"][mb])
-        loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
+        if use_clipped_value_loss:
+          value_clipped = flat["values"][mb] + (
+            value - flat["values"][mb]
+          ).clamp(-clip_param, clip_param)
+          value_losses = (value - flat["returns"][mb]).square()
+          value_losses_clipped = (value_clipped - flat["returns"][mb]).square()
+          value_loss = torch.max(value_losses, value_losses_clipped).mean()
+        else:
+          value_loss = F.mse_loss(value, flat["returns"][mb])
+        predicted_linear_vel = self.actor_critic.predict_linear_velocity(
+          flat["history"][mb]
+        )
+        vel_predict_loss = F.mse_loss(predicted_linear_vel, flat["base_lin_vel"][mb])
+        loss = (
+          policy_loss
+          + value_coef * value_loss
+          + vel_predict_coef * vel_predict_loss
+          - entropy_coef * entropy.mean()
+        )
         self.optimizer.zero_grad()
         loss.backward()
         clip_grad_norm_(self.actor_critic.parameters(), max_grad_norm)
         self.optimizer.step()
         stats["policy_loss"] += float(policy_loss.detach())
         stats["value_loss"] += float(value_loss.detach())
+        stats["vel_predict_loss"] += float(vel_predict_loss.detach())
         stats["entropy"] += float(entropy.mean().detach())
+        stats["kl_mean"] += float(kl_mean.detach())
+        stats["learning_rate"] = self.learning_rate
         updates += 1
     return {key: value / max(1, updates) for key, value in stats.items()}
 
@@ -500,7 +616,15 @@ class WMPRunner:
     batch = self.num_steps_per_env * self.num_envs
     policy_amp = rollout["amp"].reshape(batch, -1)
     policy_next_amp = rollout["next_amp"].reshape(batch, -1)
-    stats = {"loss": 0.0, "policy_acc": 0.0, "expert_acc": 0.0}
+    stats = {
+      "loss": 0.0,
+      "amp_loss": 0.0,
+      "grad_penalty": 0.0,
+      "policy_pred": 0.0,
+      "expert_pred": 0.0,
+      "policy_acc": 0.0,
+      "expert_acc": 0.0,
+    }
     count = 0
     for _ in range(updates):
       expert = self.motion_loader.sample(batch)
@@ -530,6 +654,10 @@ class WMPRunner:
       loss.backward()
       self.amp_optimizer.step()
       stats["loss"] += float(loss.detach())
+      stats["amp_loss"] += float(loss_stats["amp_loss"])
+      stats["grad_penalty"] += float(loss_stats["grad_penalty"])
+      stats["policy_pred"] += float(loss_stats["policy_pred"])
+      stats["expert_pred"] += float(loss_stats["expert_pred"])
       stats["policy_acc"] += float(loss_stats["policy_acc"])
       stats["expert_acc"] += float(loss_stats["expert_acc"])
       count += 1
@@ -707,6 +835,13 @@ class WMPRunner:
     means = flat_actions.mean(dim=0)
     stds = flat_actions.std(dim=0, unbiased=False)
     abs_means = flat_actions.abs().mean(dim=0)
+    max_abs_mean = float(abs_means.max())
+    self._writer.add_scalar("Action/max_abs_mean", max_abs_mean, iteration)
+    clip_actions = self.cfg.get("clip_actions")
+    if clip_actions is not None:
+      clip_threshold = float(clip_actions)
+      clip_fraction = (flat_actions.abs() >= clip_threshold).float().mean()
+      self._writer.add_scalar("Action/clip_fraction", float(clip_fraction), iteration)
     for idx, name in enumerate(self._action_names):
       self._writer.add_scalar(f"Action/{name}_mean", float(means[idx]), iteration)
       self._writer.add_scalar(f"Action/{name}_std", float(stds[idx]), iteration)
@@ -895,13 +1030,14 @@ class WMPRunner:
     def policy(obs) -> torch.Tensor:
       tensors = self._obs_to_tensors(obs)
       actor_obs = tensors["actor"]
+      history_obs = self._actor_history_obs(actor_obs)
       if history["value"] is None or history["value"].shape[0] != actor_obs.shape[0]:
-        history["value"] = actor_obs.unsqueeze(1).repeat(1, self.history_length, 1)
+        history["value"] = history_obs.unsqueeze(1).repeat(1, self.history_length, 1)
       else:
         old_history = history["value"]
         assert old_history is not None
         old_history = torch.roll(old_history, shifts=-1, dims=1)
-        old_history[:, -1, :] = actor_obs
+        old_history[:, -1, :] = history_obs
         history["value"] = old_history
       with torch.no_grad():
         wm_feature = self.world_model.features(tensors["wm_prop"], tensors["depth"])
@@ -937,4 +1073,11 @@ class WMPRunner:
 
   def _flatten(self, tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.to(device=self.device, dtype=torch.float32)
-    return tensor.reshape(tensor.shape[0], -1)
+    tensor = tensor.reshape(tensor.shape[0], -1)
+    if self.clip_observations > 0.0:
+      tensor = torch.clamp(
+        tensor,
+        min=-self.clip_observations,
+        max=self.clip_observations,
+      )
+    return tensor

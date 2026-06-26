@@ -27,6 +27,8 @@ class WmpPolicyCfg:
   hidden_dims: Tuple[int, ...] = (512, 256, 128)
   activation: str = "elu"
   history_length: int = 5
+  history_exclude_command: bool = True
+  clip_observations: float = 100.0
   history_latent_dim: int = 128
   wm_feature_dim: int = 128
   wm_latent_dim: int = 64
@@ -41,11 +43,15 @@ class WmpAlgorithmCfg:
   num_learning_epochs: int = 5
   num_mini_batches: int = 4
   learning_rate: float = 1.0e-3
+  schedule: str = "adaptive"
+  desired_kl: float = 0.01
   gamma: float = 0.99
   lam: float = 0.95
   clip_param: float = 0.2
   entropy_coef: float = 0.01
   value_loss_coef: float = 1.0
+  use_clipped_value_loss: bool = True
+  vel_predict_coef: float = 1.0
   max_grad_norm: float = 1.0
   normalize_advantage_per_mini_batch: bool = False
   amp_task_reward_lerp: float = 0.3

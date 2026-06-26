@@ -49,6 +49,7 @@ class ActorCriticWMP(nn.Module):
     critic_dim: int,
     action_dim: int,
     *,
+    history_dim: int | None = None,
     history_length: int,
     hidden_dims: Sequence[int],
     activation: str,
@@ -65,6 +66,7 @@ class ActorCriticWMP(nn.Module):
     self.actor_dim = actor_dim
     self.critic_dim = critic_dim
     self.action_dim = action_dim
+    self.history_dim = actor_dim if history_dim is None else history_dim
     self.history_length = history_length
     self.command_dim = command_dim
     self.command_slice = command_slice
@@ -78,7 +80,7 @@ class ActorCriticWMP(nn.Module):
       raise ValueError("min_std must be less than or equal to max_std.")
 
     self.history_encoder = build_mlp(
-      actor_dim * history_length,
+      self.history_dim * history_length,
       hidden_dims,
       history_latent_dim,
       activation,
@@ -143,6 +145,15 @@ class ActorCriticWMP(nn.Module):
     std = torch.exp(self._bounded_log_std()).expand_as(mean)
     return Normal(mean, std)
 
+  def distribution_stats(
+    self,
+    actor_obs: torch.Tensor,
+    history: torch.Tensor,
+    wm_feature: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    dist = self._dist(actor_obs, history, wm_feature)
+    return dist.mean, dist.stddev
+
   def value(self, critic_obs: torch.Tensor, wm_feature: torch.Tensor) -> torch.Tensor:
     wm_latent = self.wm_encoder(wm_feature)
     return self.critic(torch.cat((critic_obs, wm_latent), dim=-1)).squeeze(-1)
@@ -181,6 +192,13 @@ class ActorCriticWMP(nn.Module):
     wm_feature: torch.Tensor,
   ) -> torch.Tensor:
     return self._dist(actor_obs, history, wm_feature).mean
+
+  def predict_linear_velocity(self, history: torch.Tensor) -> torch.Tensor:
+    history_flat = history.reshape(history.shape[0], -1)
+    latent = self.history_encoder(history_flat)
+    if latent.shape[-1] < 3:
+      raise ValueError("history_latent_dim must be at least 3 for velocity prediction.")
+    return latent[:, -3:]
 
 
 class SimpleWorldModel(nn.Module):
