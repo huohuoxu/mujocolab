@@ -8,10 +8,13 @@
 
 ## Current Milestone
 
-- M6 complete: Dreamer, ActorCriticWMP dimensions, AMP/PPO joint optimizer,
+- M7 complete: Dreamer, ActorCriticWMP dimensions, AMP/PPO joint optimizer,
   critic privileged observations, and reward weights are implemented and
   validated at unit/config/smoke level. WMP privileged randomization cache now
   reads actual post-DR simulator/entity values instead of re-sampling fake values.
+  Play/checkpoint loading now ignores transient Dreamer RSSM hidden state and
+  shape-checks runner world-model buffers so models trained with 2048 envs can
+  be viewed with a different play env count.
 
 ## Completed Gates
 
@@ -37,6 +40,10 @@
   PD gain deltas from `actuator_gainprm/biasprm`, motor-strength scale from
   `actuator_forcerange`, base mass from `body_mass`, COM from `body_ipos`, and
   friction from `geom_friction`.
+- M7: Fixed play/checkpoint loading for Dreamer RSSM state. Checkpoints save only
+  world-model weights/config, old checkpoints with a saved `state` ignore that
+  runtime state on load, and `features()` drops any remaining state whose batch
+  size differs from the current observations.
 
 ## Changed Files
 
@@ -55,7 +62,10 @@
 - Passed: `uv --cache-dir .tmp\uv-cache run python -m py_compile ...`
   for touched WMP runner, Dreamer, AMP, MDP, env cfg, and tests.
 - Passed: `uv --cache-dir .tmp\uv-cache run pytest --basetemp .tmp\pytest tests\test_a1_constants.py tests\test_asset_zoo.py tests\test_wmp_task.py -q`
-  with `25 passed, 5 warnings`.
+  with `27 passed, 6 warnings`.
+- Passed: `uv --cache-dir .tmp\uv-cache run pytest --basetemp .tmp\pytest tests\test_wmp_task.py -q`
+  with `19 passed, 6 warnings`, including a regression that loads a checkpoint
+  carrying stale batch-2048 Dreamer state and runs batch-2 inference.
 - Passed: task config load for:
   - `Mjlab-WMP-Rough-Unitree-Go1`
   - `Mjlab-WMP-Stairs-Only-Unitree-Go1`

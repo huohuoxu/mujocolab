@@ -959,6 +959,115 @@ def test_wmp_dreamer_adapter_trains_batch_and_reports_original_metrics():
   assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
 
 
+def test_wmp_dreamer_adapter_ignores_checkpoint_runtime_state_batch():
+  adapter = DreamerWorldModelAdapter(
+    prop_dim=5,
+    action_dim=4,
+    depth_shape=(8, 8, 1),
+    device=torch.device("cpu"),
+    use_camera=True,
+    config_overrides={
+      "dyn_hidden": 16,
+      "dyn_deter": 16,
+      "dyn_stoch": 4,
+      "dyn_discrete": 4,
+      "units": 16,
+      "encoder": {
+        "mlp_keys": ".*",
+        "cnn_keys": "image",
+        "act": "SiLU",
+        "norm": True,
+        "cnn_depth": 2,
+        "kernel_size": 4,
+        "minres": 4,
+        "mlp_layers": 1,
+        "mlp_units": 16,
+        "symlog_inputs": True,
+      },
+      "decoder": {
+        "mlp_keys": ".*",
+        "cnn_keys": "image",
+        "act": "SiLU",
+        "norm": True,
+        "cnn_depth": 2,
+        "kernel_size": 4,
+        "minres": 4,
+        "mlp_layers": 1,
+        "mlp_units": 16,
+        "cnn_sigmoid": False,
+        "image_dist": "mse",
+        "vector_dist": "symlog_mse",
+        "outscale": 1.0,
+      },
+      "reward_head": {
+        "layers": 1,
+        "dist": "symlog_disc",
+        "loss_scale": 0.0,
+        "outscale": 0.0,
+      },
+    },
+  )
+  stale_state = adapter.model.dynamics.initial(2048)
+  state = adapter.state_dict()
+  state["state"] = stale_state
+
+  loaded = DreamerWorldModelAdapter(
+    prop_dim=5,
+    action_dim=4,
+    depth_shape=(8, 8, 1),
+    device=torch.device("cpu"),
+    use_camera=True,
+    config_overrides={
+      "dyn_hidden": 16,
+      "dyn_deter": 16,
+      "dyn_stoch": 4,
+      "dyn_discrete": 4,
+      "units": 16,
+      "encoder": {
+        "mlp_keys": ".*",
+        "cnn_keys": "image",
+        "act": "SiLU",
+        "norm": True,
+        "cnn_depth": 2,
+        "kernel_size": 4,
+        "minres": 4,
+        "mlp_layers": 1,
+        "mlp_units": 16,
+        "symlog_inputs": True,
+      },
+      "decoder": {
+        "mlp_keys": ".*",
+        "cnn_keys": "image",
+        "act": "SiLU",
+        "norm": True,
+        "cnn_depth": 2,
+        "kernel_size": 4,
+        "minres": 4,
+        "mlp_layers": 1,
+        "mlp_units": 16,
+        "cnn_sigmoid": False,
+        "image_dist": "mse",
+        "vector_dist": "symlog_mse",
+        "outscale": 1.0,
+      },
+      "reward_head": {
+        "layers": 1,
+        "dist": "symlog_disc",
+        "loss_scale": 0.0,
+        "outscale": 0.0,
+      },
+    },
+  )
+  loaded.load_state_dict(state)
+  feature = loaded.features(
+    torch.zeros(2, 5),
+    torch.zeros(2, 8, 8, 1),
+    torch.zeros(2, 4),
+  )
+
+  assert feature.shape == (2, 16)
+
+
 def test_wmp_modules_shapes_and_losses_are_finite():
   batch = 4
   actor_dim = 45

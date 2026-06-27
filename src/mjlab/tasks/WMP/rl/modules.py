@@ -387,6 +387,10 @@ class DreamerWorldModelAdapter(nn.Module):
     is_first: torch.Tensor | None = None,
   ) -> torch.Tensor:
     batch = prop.shape[0]
+    if self._state is not None:
+      state_batch = next(iter(self._state.values())).shape[0]
+      if state_batch != batch:
+        self._state = None
     if action is None:
       action = torch.zeros(batch, self.action_dim, device=prop.device)
     if is_first is None:
@@ -427,20 +431,15 @@ class DreamerWorldModelAdapter(nn.Module):
     return {
       "model": self.model.state_dict(*args, **kwargs),
       "config": _namespace_to_dict(self.config),
-      "state": None
-      if self._state is None
-      else {key: value.detach().cpu() for key, value in self._state.items()},
     }
 
   def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
     if "model" in state_dict:
       self.model.load_state_dict(state_dict["model"], strict=strict)
-      state = state_dict.get("state")
-      if state is not None:
-        device = next(self.model.parameters()).device
-        self._state = {key: value.to(device=device) for key, value in state.items()}
+      self._state = None
       return
     self.model.load_state_dict(state_dict, strict=strict)
+    self._state = None
 
   def _prepare_depth(
     self,

@@ -199,6 +199,11 @@ class WMPRunner:
       device=self.device,
     )
     self._wm_reward_accum = torch.zeros(self.num_envs, device=self.device)
+    self._wm_is_first = torch.ones(
+      self.num_envs,
+      device=self.device,
+      dtype=torch.bool,
+    )
     self._history = (
       self._actor_history_obs(tensors["actor"])
       .unsqueeze(1)
@@ -1187,12 +1192,24 @@ class WMPRunner:
         self.world_model_dataset.load_state_dict(state["world_model_dataset_state_dict"])
     runner_state = state.get("runner_state", {})
     self._depth_step = int(runner_state.get("depth_step", self._depth_step))
-    if "wm_action_history" in runner_state:
-      self._wm_action_history = runner_state["wm_action_history"].to(self.device)
-    if "wm_reward_accum" in runner_state:
-      self._wm_reward_accum = runner_state["wm_reward_accum"].to(self.device)
-    if "wm_is_first" in runner_state:
-      self._wm_is_first = runner_state["wm_is_first"].to(self.device)
+    wm_action_history = runner_state.get("wm_action_history")
+    if (
+      torch.is_tensor(wm_action_history)
+      and tuple(wm_action_history.shape) == tuple(self._wm_action_history.shape)
+    ):
+      self._wm_action_history = wm_action_history.to(self.device)
+    wm_reward_accum = runner_state.get("wm_reward_accum")
+    if (
+      torch.is_tensor(wm_reward_accum)
+      and tuple(wm_reward_accum.shape) == tuple(self._wm_reward_accum.shape)
+    ):
+      self._wm_reward_accum = wm_reward_accum.to(self.device)
+    wm_is_first = runner_state.get("wm_is_first")
+    if (
+      torch.is_tensor(wm_is_first)
+      and tuple(wm_is_first.shape) == tuple(self._wm_is_first.shape)
+    ):
+      self._wm_is_first = wm_is_first.to(self.device)
     self.current_learning_iteration = int(state.get("iter", 0))
     infos = state.get("infos", {})
     if infos and "env_state" in infos:
