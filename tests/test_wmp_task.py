@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 
 import mjlab.tasks  # noqa: F401
+from mjlab.actuator import BuiltinPositionActuator
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.scripts.train import TrainConfig
 from mjlab.sensor import (
   CameraSensor,
@@ -23,6 +25,7 @@ from mjlab.tasks.WMP.rl.amp import AMPDiscriminator
 from mjlab.tasks.WMP.rl.modules import (
   ActorCriticWMP,
   DepthPredictor,
+  DreamerWorldModelAdapter,
   SimpleWorldModel,
 )
 from mjlab.tasks.WMP.rl.runner import WMPRunner
@@ -104,10 +107,72 @@ def test_wmp_task_registered_and_cfg_serializable():
     "thigh_ground_touch",
     "shank_ground_touch",
   )
+  reward_weights = {name: term.weight for name, term in cfg.env.rewards.items()}
+  assert reward_weights == {
+    "tracking_lin_vel": 1.5,
+    "tracking_ang_vel": 0.5,
+    "lin_vel_z": -1.0,
+    "torques": -1.0e-4,
+    "dof_acc": -2.5e-7,
+    "action_rate": -0.03,
+    "dof_error": -0.04,
+    "feet_air_time": 0.5,
+    "collision": -1.0,
+    "feet_stumble": -0.1,
+    "feet_edge": -1.0,
+    "cheat": -1.0,
+    "stuck": -1.0,
+    "only_positive_clip": 1.0,
+  }
   assert "upright" not in cfg.env.rewards
   assert "feet_slip" not in cfg.env.rewards
   assert "thigh_collision" not in cfg.env.rewards
   assert "trunk_collision" not in cfg.env.rewards
+  assert tuple(cfg.env.observations["critic"].terms) == (
+    "foot_contact",
+    "foot_contact_forces",
+    "d_gains",
+    "p_gains",
+    "base_com",
+    "base_mass",
+    "restitution",
+    "friction",
+    "base_lin_vel",
+    "base_ang_vel",
+    "projected_gravity",
+    "command",
+    "joint_pos",
+    "joint_vel",
+    "actions",
+    "height_scan",
+  )
+  assert cfg.env.observations["critic"].terms["foot_contact_forces"].params == {
+    "sensor_name": "feet_ground_contact",
+    "scale": 0.005,
+  }
+  assert cfg.env.observations["critic"].terms["d_gains"].params == {
+    "key": "d_gains",
+    "dim": 12,
+    "scale": 5.0,
+  }
+  assert cfg.env.observations["critic"].terms["p_gains"].params == {
+    "key": "p_gains",
+    "dim": 12,
+    "scale": 5.0,
+  }
+  assert cfg.env.observations["critic"].terms["base_com"].params == {
+    "key": "base_com",
+    "dim": 3,
+    "scale": 20.0,
+  }
+  assert cfg.env.events["reset_robot_joints"].func is mdp.reset_joints_by_scale
+  assert cfg.env.events["reset_robot_joints"].params["position_scale_range"] == (
+    0.5,
+    1.5,
+  )
+  assert cfg.env.events["cache_privileged_randomization"].func is (
+    mdp.cache_privileged_randomization
+  )
 
 
 def test_wmp_play_randomizes_terrain_origin_before_base_reset():
@@ -561,6 +626,155 @@ def test_wmp_feet_edge_stumble_curriculum_and_clip_rewards():
   )
 
 
+class _FakeWmpDrModel:
+  def __init__(self) -> None:
+    self.actuator_gainprm = torch.zeros(2, 3, 10)
+    self.actuator_biasprm = torch.zeros(2, 3, 10)
+    self.actuator_forcerange = torch.zeros(2, 3, 2)
+    self.body_mass = torch.tensor(
+      [
+        [0.0, 6.5],
+        [0.0, 7.25],
+      ],
+      dtype=torch.float32,
+    )
+    self.body_ipos = torch.zeros(2, 2, 3)
+    self.body_ipos[0, 1] = torch.tensor([0.02, -0.01, 0.03])
+    self.body_ipos[1, 1] = torch.tensor([-0.04, 0.05, -0.02])
+    self.geom_friction = torch.zeros(2, 4, 3)
+    self.geom_friction[0, :, 0] = torch.tensor([0.3, 1.4, 1.6, 0.9])
+    self.geom_friction[1, :, 0] = torch.tensor([1.1, 0.7, 1.3, 2.0])
+
+
+class _FakeWmpDrSim:
+  def __init__(self) -> None:
+    self.model = _FakeWmpDrModel()
+    self._defaults = {
+      "actuator_gainprm": torch.zeros(3, 10),
+      "actuator_biasprm": torch.zeros(3, 10),
+      "actuator_forcerange": torch.zeros(3, 2),
+      "body_mass": torch.tensor([0.0, 5.0]),
+      "body_ipos": torch.zeros(2, 3),
+    }
+    self._defaults["actuator_gainprm"][:, 0] = torch.tensor([40.0, 50.0, 60.0])
+    self._defaults["actuator_biasprm"][:, 1] = -torch.tensor([40.0, 50.0, 60.0])
+    self._defaults["actuator_biasprm"][:, 2] = -torch.tensor([1.0, 2.0, 3.0])
+    self._defaults["actuator_forcerange"][:, 1] = torch.tensor([20.0, 30.0, 40.0])
+    self.model.actuator_gainprm[:, :, 0] = torch.tensor(
+      [
+        [44.0, 45.0, 72.0],
+        [36.0, 60.0, 54.0],
+      ]
+    )
+    self.model.actuator_biasprm[:, :, 2] = -torch.tensor(
+      [
+        [1.2, 1.6, 3.3],
+        [0.8, 2.4, 2.7],
+      ]
+    )
+    self.model.actuator_forcerange[:, :, 1] = torch.tensor(
+      [
+        [18.0, 33.0, 44.0],
+        [22.0, 27.0, 36.0],
+      ]
+    )
+
+  def get_default_field(self, field: str) -> torch.Tensor:
+    return self._defaults[field]
+
+
+class _FakeWmpDrIndexing:
+  def __init__(self) -> None:
+    self.body_ids = torch.tensor([0, 1])
+    self.geom_ids = torch.tensor([0, 1, 2, 3])
+
+
+class _FakeWmpDrRobot:
+  def __init__(self) -> None:
+    self.num_joints = 3
+    self.body_names = ("world", "trunk")
+    self.geom_names = (
+      "FR_foot_collision",
+      "FL_foot_collision",
+      "RR_foot_collision",
+      "RL_foot_collision",
+    )
+    self.indexing = _FakeWmpDrIndexing()
+    actuator = object.__new__(BuiltinPositionActuator)
+    actuator._target_ids = torch.tensor([0, 1, 2])
+    actuator._global_ctrl_ids = torch.tensor([0, 1, 2])
+    self.actuators = [actuator]
+
+
+class _FakeWmpDrScene:
+  def __init__(self) -> None:
+    self._robot = _FakeWmpDrRobot()
+
+  def __getitem__(self, name: str):
+    assert name == "robot"
+    return self._robot
+
+
+class _FakeWmpDrEnv:
+  def __init__(self) -> None:
+    self.num_envs = 2
+    self.device = "cpu"
+    self.sim = _FakeWmpDrSim()
+    self.scene = _FakeWmpDrScene()
+
+
+def test_wmp_privileged_randomization_cache_reads_actual_dr_fields():
+  env = _FakeWmpDrEnv()
+
+  mdp.cache_privileged_randomization(
+    env,
+    torch.tensor([0, 1]),
+    asset_cfg=SceneEntityCfg("robot", joint_ids=[0, 1, 2]),
+    foot_geom_names=(
+      "FR_foot_collision",
+      "FL_foot_collision",
+      "RR_foot_collision",
+      "RL_foot_collision",
+    ),
+  )
+
+  cache = env._wmp_privileged_randomization
+  assert torch.allclose(
+    cache["p_gains"],
+    torch.tensor(
+      [
+        [0.1, -0.1, 0.2],
+        [-0.1, 0.2, -0.1],
+      ]
+    ),
+  )
+  assert torch.allclose(
+    cache["d_gains"],
+    torch.tensor(
+      [
+        [0.2, -0.2, 0.1],
+        [-0.2, 0.2, -0.1],
+      ]
+    ),
+  )
+  assert torch.allclose(
+    cache["motor_strength"],
+    torch.tensor(
+      [
+        [0.9, 1.1, 1.1],
+        [1.1, 0.9, 0.9],
+      ]
+    ),
+  )
+  assert torch.allclose(cache["base_mass"], torch.tensor([[1.5], [2.25]]))
+  assert torch.allclose(
+    cache["base_com"],
+    torch.tensor([[0.02, -0.01, 0.03], [-0.04, 0.05, -0.02]]),
+  )
+  assert torch.allclose(cache["friction"], torch.tensor([[1.05], [1.275]]))
+  assert torch.allclose(cache["restitution"], torch.zeros(2, 1))
+
+
 def test_wmp_motion_loader_reads_original_json_layout(tmp_path: Path):
   frames = torch.arange(3 * 61, dtype=torch.float32).reshape(3, 61).tolist()
   motion_path = tmp_path / "motion.txt"
@@ -633,6 +847,116 @@ def test_wmp_amp_discriminator_reward_matches_original_quadratic_formula():
   reward = disc.reward(amp_obs, next_amp_obs, reward_scale=0.01)
 
   assert torch.allclose(reward, torch.full((4,), 0.01))
+
+
+def test_wmp_actor_critic_defaults_match_original_wmp_dims():
+  actor_critic = ActorCriticWMP(
+    actor_dim=45,
+    critic_dim=286,
+    action_dim=12,
+    history_dim=42,
+    history_length=5,
+    hidden_dims=(512, 256, 128),
+    encoder_hidden_dims=(256, 128),
+    wm_encoder_hidden_dims=(64, 64),
+    actor_hidden_dims=(256, 128, 64),
+    critic_hidden_dims=(512, 256, 128),
+    activation="elu",
+    history_latent_dim=35,
+    wm_feature_dim=512,
+    wm_latent_dim=32,
+    command_dim=3,
+    init_std=1.0,
+  )
+  history = torch.zeros(2, 5, 42)
+  actor = torch.zeros(2, 45)
+  critic = torch.zeros(2, 286)
+  wm_feature = torch.zeros(2, 512)
+
+  mean, std = actor_critic.distribution_stats(actor, history, wm_feature)
+  value = actor_critic.value(critic, wm_feature)
+
+  assert actor_critic.history_encoder[-1].out_features == 35
+  assert actor_critic.wm_feature_encoder[-1].out_features == 32
+  assert actor_critic.critic_wm_feature_encoder[-1].out_features == 32
+  assert mean.shape == (2, 12)
+  assert std.shape == (2, 12)
+  assert value.shape == (2,)
+
+
+def test_wmp_dreamer_adapter_trains_batch_and_reports_original_metrics():
+  adapter = DreamerWorldModelAdapter(
+    prop_dim=5,
+    action_dim=4,
+    depth_shape=(8, 8, 1),
+    device=torch.device("cpu"),
+    use_camera=True,
+    config_overrides={
+      "dyn_hidden": 16,
+      "dyn_deter": 16,
+      "dyn_stoch": 4,
+      "dyn_discrete": 4,
+      "units": 16,
+      "encoder": {
+        "mlp_keys": ".*",
+        "cnn_keys": "image",
+        "act": "SiLU",
+        "norm": True,
+        "cnn_depth": 2,
+        "kernel_size": 4,
+        "minres": 4,
+        "mlp_layers": 1,
+        "mlp_units": 16,
+        "symlog_inputs": True,
+      },
+      "decoder": {
+        "mlp_keys": ".*",
+        "cnn_keys": "image",
+        "act": "SiLU",
+        "norm": True,
+        "cnn_depth": 2,
+        "kernel_size": 4,
+        "minres": 4,
+        "mlp_layers": 1,
+        "mlp_units": 16,
+        "cnn_sigmoid": False,
+        "image_dist": "mse",
+        "vector_dist": "symlog_mse",
+        "outscale": 1.0,
+      },
+      "reward_head": {
+        "layers": 1,
+        "dist": "symlog_disc",
+        "loss_scale": 0.0,
+        "outscale": 0.0,
+      },
+      "model_lr": 1.0e-4,
+      "grad_clip": 100.0,
+    },
+  )
+  batch = {
+    "prop": torch.zeros(2, 3, 5).numpy(),
+    "image": torch.zeros(2, 3, 8, 8, 1).numpy(),
+    "action": torch.zeros(2, 3, 4).numpy(),
+    "reward": torch.zeros(2, 3).numpy(),
+    "is_first": torch.zeros(2, 3).numpy(),
+  }
+  batch["is_first"][:, 0] = 1.0
+
+  feature = adapter.features(
+    torch.zeros(2, 5),
+    torch.zeros(2, 8, 8, 1),
+    torch.zeros(2, 4),
+  )
+  metrics = adapter.train_world_model(batch, train_steps=1)
+
+  assert feature.shape == (2, 16)
+  assert "kl" in metrics
+  assert "dyn_loss" in metrics
+  assert "rep_loss" in metrics
+  assert "image_loss" in metrics
+  assert "reward_loss" in metrics
+  assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
 
 
 def test_wmp_modules_shapes_and_losses_are_finite():
@@ -844,6 +1168,7 @@ def _tiny_runner_cfg(expert_motion_files: tuple[str, ...] = ()) -> dict:
     "world_model": {
       "hidden_dims": (16,),
       "feature_dim": 16,
+      "dyn_deter": 16,
       "learning_rate": 1.0e-3,
       "update_interval": 1,
       "reward_loss_scale": 1.0,
@@ -960,7 +1285,7 @@ def test_wmp_runner_learn_save_load_with_fake_env(tmp_path: Path):
   assert runner.current_learning_iteration == 1
   assert runner._depth_step == 2
   assert runner.amp_normalizer.count > 1.0
-  assert runner.world_model.stoch_dim == 32
+  assert runner.world_model.config.dyn_stoch == 32
 
   checkpoint = tmp_path / "model.pt"
   runner.save(str(checkpoint))

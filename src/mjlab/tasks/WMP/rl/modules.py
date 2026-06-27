@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 from collections.abc import Sequence
 
+import numpy as np
 import torch
+import yaml
 from torch import nn
 from torch.distributions import Normal
 from torch.nn import functional as F
+
+from mjlab.tasks.WMP.rl.dreamer.models import WorldModel as DreamerWorldModel
 
 
 def _activation(name: str) -> type[nn.Module]:
@@ -51,7 +58,11 @@ class ActorCriticWMP(nn.Module):
     *,
     history_dim: int | None = None,
     history_length: int,
-    hidden_dims: Sequence[int],
+    hidden_dims: Sequence[int] | None = None,
+    encoder_hidden_dims: Sequence[int] | None = None,
+    wm_encoder_hidden_dims: Sequence[int] | None = None,
+    actor_hidden_dims: Sequence[int] | None = None,
+    critic_hidden_dims: Sequence[int] | None = None,
     activation: str,
     history_latent_dim: int,
     wm_feature_dim: int,
@@ -72,6 +83,16 @@ class ActorCriticWMP(nn.Module):
     self.command_slice = command_slice
     self.min_log_std = math.log(min_std) if min_std is not None else None
     self.max_log_std = math.log(max_std) if max_std is not None else None
+    if hidden_dims is None:
+      hidden_dims = (512, 256, 128)
+    if encoder_hidden_dims is None:
+      encoder_hidden_dims = hidden_dims
+    if wm_encoder_hidden_dims is None:
+      wm_encoder_hidden_dims = (wm_latent_dim,)
+    if actor_hidden_dims is None:
+      actor_hidden_dims = hidden_dims
+    if critic_hidden_dims is None:
+      critic_hidden_dims = hidden_dims
     if (
       self.min_log_std is not None
       and self.max_log_std is not None
@@ -81,26 +102,31 @@ class ActorCriticWMP(nn.Module):
 
     self.history_encoder = build_mlp(
       self.history_dim * history_length,
-      hidden_dims,
+      encoder_hidden_dims,
       history_latent_dim,
       activation,
     )
-    self.wm_encoder = build_mlp(
+    self.wm_feature_encoder = build_mlp(
       wm_feature_dim,
-      (wm_latent_dim,),
+      wm_encoder_hidden_dims,
       wm_latent_dim,
       activation,
-      final_activation=nn.Tanh(),
+    )
+    self.critic_wm_feature_encoder = build_mlp(
+      wm_feature_dim,
+      wm_encoder_hidden_dims,
+      wm_latent_dim,
+      activation,
     )
     self.actor = build_mlp(
       history_latent_dim + command_dim + wm_latent_dim,
-      hidden_dims,
+      actor_hidden_dims,
       action_dim,
       activation,
     )
     self.critic = build_mlp(
       critic_dim + wm_latent_dim,
-      hidden_dims,
+      critic_hidden_dims,
       1,
       activation,
     )
@@ -130,7 +156,7 @@ class ActorCriticWMP(nn.Module):
   ) -> tuple[torch.Tensor, torch.Tensor]:
     history_flat = history.reshape(history.shape[0], -1)
     history_latent = self.history_encoder(history_flat)
-    wm_latent = self.wm_encoder(wm_feature)
+    wm_latent = self.wm_feature_encoder(wm_feature)
     actor_input = torch.cat(
       (history_latent, self._command(actor_obs), wm_latent),
       dim=-1,
@@ -155,7 +181,7 @@ class ActorCriticWMP(nn.Module):
     return dist.mean, dist.stddev
 
   def value(self, critic_obs: torch.Tensor, wm_feature: torch.Tensor) -> torch.Tensor:
-    wm_latent = self.wm_encoder(wm_feature)
+    wm_latent = self.critic_wm_feature_encoder(wm_feature)
     return self.critic(torch.cat((critic_obs, wm_latent), dim=-1)).squeeze(-1)
 
   def act(
@@ -199,6 +225,274 @@ class ActorCriticWMP(nn.Module):
     if latent.shape[-1] < 3:
       raise ValueError("history_latent_dim must be at least 3 for velocity prediction.")
     return latent[:, -3:]
+
+
+def _to_namespace(value):
+  if isinstance(value, dict):
+    converted = {}
+    for key, val in value.items():
+      if key in {"encoder", "decoder", "actor", "critic", "reward_head", "cont_head"}:
+        converted[key] = val
+      else:
+        converted[key] = _to_namespace(val)
+    return SimpleNamespace(**converted)
+  if isinstance(value, list):
+    return [_to_namespace(val) for val in value]
+  return value
+
+
+def _namespace_to_dict(value):
+  if isinstance(value, SimpleNamespace):
+    return {key: _namespace_to_dict(val) for key, val in vars(value).items()}
+  if isinstance(value, list):
+    return [_namespace_to_dict(val) for val in value]
+  return value
+
+
+class DreamerEpisodeDataset:
+  """Episode-level replay buffer matching the original WMP world-model input."""
+
+  def __init__(self, limit_steps: int = 200_000, seed: int = 0) -> None:
+    self.limit_steps = int(limit_steps)
+    self._episodes: list[dict[str, np.ndarray]] = []
+    self._rng = np.random.RandomState(seed)
+    self._steps = 0
+
+  @property
+  def num_steps(self) -> int:
+    return self._steps
+
+  @property
+  def num_episodes(self) -> int:
+    return len(self._episodes)
+
+  def add_episode(self, episode: dict[str, torch.Tensor]) -> None:
+    if not episode:
+      return
+    converted = {
+      key: value.detach().cpu().numpy().astype(np.float32)
+      for key, value in episode.items()
+    }
+    length = int(next(iter(converted.values())).shape[0])
+    if length < 2:
+      return
+    self._episodes.append(converted)
+    self._steps += length
+    self._trim()
+
+  def sample(self, batch_size: int, batch_length: int) -> dict[str, np.ndarray] | None:
+    valid = [
+      episode
+      for episode in self._episodes
+      if int(next(iter(episode.values())).shape[0]) >= batch_length
+    ]
+    if not valid:
+      return None
+    batch: list[dict[str, np.ndarray]] = []
+    probs = np.asarray(
+      [int(next(iter(episode.values())).shape[0]) for episode in valid],
+      dtype=np.float64,
+    )
+    probs = probs / probs.sum()
+    for _ in range(batch_size):
+      episode = valid[int(self._rng.choice(len(valid), p=probs))]
+      total = int(next(iter(episode.values())).shape[0])
+      start = int(self._rng.randint(0, total - batch_length + 1))
+      item = {
+        key: value[start : start + batch_length].copy()
+        for key, value in episode.items()
+      }
+      item["is_first"][0] = 1.0
+      batch.append(item)
+    return {
+      key: np.stack([item[key] for item in batch], axis=0)
+      for key in batch[0].keys()
+    }
+
+  def state_dict(self) -> dict[str, object]:
+    return {
+      "episodes": self._episodes,
+      "steps": self._steps,
+      "limit_steps": self.limit_steps,
+      "rng_state": self._rng.get_state(),
+    }
+
+  def load_state_dict(self, state: dict[str, object]) -> None:
+    self.limit_steps = int(state.get("limit_steps", self.limit_steps))
+    self._episodes = list(state.get("episodes", []))
+    self._steps = int(state.get("steps", 0))
+    rng_state = state.get("rng_state")
+    if rng_state is not None:
+      self._rng.set_state(rng_state)
+
+  def _trim(self) -> None:
+    if self.limit_steps <= 0:
+      return
+    while self._steps > self.limit_steps and self._episodes:
+      episode = self._episodes.pop(0)
+      self._steps -= int(next(iter(episode.values())).shape[0])
+
+
+class DreamerWorldModelAdapter(nn.Module):
+  """Adapter around the original WMP Dreamer world model."""
+
+  def __init__(
+    self,
+    prop_dim: int,
+    action_dim: int,
+    depth_shape: tuple[int, int, int],
+    *,
+    device: torch.device,
+    config_overrides: dict[str, object] | None = None,
+    use_camera: bool = True,
+  ) -> None:
+    super().__init__()
+    self.prop_dim = int(prop_dim)
+    self.action_dim = int(action_dim)
+    self.depth_shape = tuple(int(v) for v in depth_shape)
+    self.use_camera = bool(use_camera)
+    config = self._load_config()
+    config["device"] = str(device)
+    config["num_actions"] = self.action_dim
+    if config_overrides:
+      config = self._merge_config(config, config_overrides)
+    self.config = _to_namespace(config)
+    obs_shape = {
+      "prop": (self.prop_dim,),
+      "image": self.depth_shape,
+    }
+    self.model = DreamerWorldModel(self.config, obs_shape, use_camera=self.use_camera)
+    self.feature_dim = int(self.config.dyn_deter)
+    self._state: dict[str, torch.Tensor] | None = None
+
+  def reset_state(self, done: torch.Tensor | None = None) -> None:
+    if done is None or self._state is None:
+      self._state = None
+      return
+    if not done.any():
+      return
+    init = self.model.dynamics.initial(done.shape[0])
+    mask = done.to(dtype=torch.float32, device=done.device)
+    for key, value in self._state.items():
+      view_shape = (mask.shape[0],) + (1,) * (value.dim() - 1)
+      self._state[key] = value * (1.0 - mask.view(view_shape)) + init[key] * mask.view(
+        view_shape
+      )
+
+  def features(
+    self,
+    prop: torch.Tensor,
+    depth: torch.Tensor | None = None,
+    action: torch.Tensor | None = None,
+    is_first: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    batch = prop.shape[0]
+    if action is None:
+      action = torch.zeros(batch, self.action_dim, device=prop.device)
+    if is_first is None:
+      is_first = torch.zeros(batch, device=prop.device, dtype=torch.bool)
+    image = self._prepare_depth(depth, batch, prop.device)
+    data = {
+      "prop": prop.unsqueeze(1),
+      "image": image.unsqueeze(1),
+      "action": action.unsqueeze(1),
+      "is_first": is_first.reshape(batch, 1).float(),
+    }
+    with torch.no_grad():
+      embed = self.model.encoder(data)
+      post, _prior = self.model.dynamics.observe(
+        embed,
+        data["action"],
+        data["is_first"],
+        self._state,
+      )
+      self._state = {key: value[:, -1].detach() for key, value in post.items()}
+      return self.model.dynamics.get_deter_feat(post)[:, -1].detach()
+
+  def train_world_model(
+    self,
+    batch: dict[str, np.ndarray],
+    *,
+    train_steps: int = 1,
+  ) -> dict[str, float]:
+    metrics_sum: dict[str, float] = {}
+    for _ in range(max(1, int(train_steps))):
+      _post, _context, metrics = self.model._train(batch)
+      for key, value in metrics.items():
+        array = np.asarray(value, dtype=np.float64)
+        metrics_sum[key] = metrics_sum.get(key, 0.0) + float(np.mean(array))
+    return {key: value / max(1, int(train_steps)) for key, value in metrics_sum.items()}
+
+  def state_dict(self, *args, **kwargs):  # type: ignore[override]
+    return {
+      "model": self.model.state_dict(*args, **kwargs),
+      "config": _namespace_to_dict(self.config),
+      "state": None
+      if self._state is None
+      else {key: value.detach().cpu() for key, value in self._state.items()},
+    }
+
+  def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
+    if "model" in state_dict:
+      self.model.load_state_dict(state_dict["model"], strict=strict)
+      state = state_dict.get("state")
+      if state is not None:
+        device = next(self.model.parameters()).device
+        self._state = {key: value.to(device=device) for key, value in state.items()}
+      return
+    self.model.load_state_dict(state_dict, strict=strict)
+
+  def _prepare_depth(
+    self,
+    depth: torch.Tensor | None,
+    batch: int,
+    device: torch.device,
+  ) -> torch.Tensor:
+    if depth is None or depth.numel() == 0:
+      return torch.zeros(batch, *self.depth_shape, device=device)
+    depth = depth.to(device=device, dtype=torch.float32)
+    if depth.dim() == 2:
+      height, width, channels = self.depth_shape
+      return depth.reshape(batch, height, width, channels)
+    if depth.dim() == 3:
+      return depth.unsqueeze(-1)
+    if depth.dim() == 4:
+      return depth
+    raise ValueError(f"Unsupported depth tensor shape: {tuple(depth.shape)}")
+
+  def _load_config(self) -> dict[str, object]:
+    path = Path(__file__).resolve().parent / "dreamer" / "configs.yaml"
+    with path.open("r", encoding="utf-8") as f:
+      data = yaml.safe_load(f)
+    return self._coerce_numeric_strings(deepcopy(data["defaults"]))
+
+  def _coerce_numeric_strings(self, value):
+    if isinstance(value, dict):
+      return {key: self._coerce_numeric_strings(val) for key, val in value.items()}
+    if isinstance(value, list):
+      return [self._coerce_numeric_strings(val) for val in value]
+    if isinstance(value, str):
+      try:
+        return float(value)
+      except ValueError:
+        return value
+    return value
+
+  def _merge_config(
+    self,
+    base: dict[str, object],
+    overrides: dict[str, object],
+  ) -> dict[str, object]:
+    merged = deepcopy(base)
+    for key, value in overrides.items():
+      if (
+        isinstance(value, dict)
+        and isinstance(merged.get(key), dict)
+      ):
+        merged[key] = self._merge_config(merged[key], value)  # type: ignore[arg-type]
+      else:
+        merged[key] = value
+    return merged
 
 
 class SimpleWorldModel(nn.Module):

@@ -5,13 +5,24 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
 
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.tasks.WMP.rl.amp import AMPDiscriminator, MotionLoader, RunningNormalizer
-from mjlab.tasks.WMP.rl.modules import ActorCriticWMP, DepthPredictor, SimpleWorldModel
+from mjlab.tasks.WMP.rl.amp import (
+  AMPDiscriminator,
+  AMPReplayBuffer,
+  MotionLoader,
+  RunningNormalizer,
+)
+from mjlab.tasks.WMP.rl.modules import (
+  ActorCriticWMP,
+  DepthPredictor,
+  DreamerEpisodeDataset,
+  DreamerWorldModelAdapter,
+)
 
 
 class WMPRunner:
@@ -50,6 +61,7 @@ class WMPRunner:
     prop_dim = tensors["wm_prop"].shape[-1]
     height_dim = tensors["height"].shape[-1]
     depth_dim = tensors["depth"].shape[-1]
+    self.depth_shape = self._depth_shape(obs)
     amp_obs_dim = tensors["amp"].shape[-1]
     action_dim = env.num_actions
 
@@ -60,9 +72,35 @@ class WMPRunner:
     self.command_dim = int(policy_cfg.get("command_dim", 3))
     self.command_slice = self._resolve_command_slice(actor_dim, self.command_dim)
     history_dim = self._actor_history_obs(tensors["actor"]).shape[-1]
-    wm_feature_dim = int(
-      world_cfg.get("feature_dim", policy_cfg.get("wm_feature_dim", 128))
+    wm_feature_dim = int(world_cfg.get("dyn_deter", 512))
+    self.depth_update_interval = max(
+      1,
+      int(
+        world_cfg.get(
+          "update_interval",
+          train_cfg.get("depth_predictor", {}).get("camera_update_interval", 5),
+        )
+      ),
     )
+    self.world_model = DreamerWorldModelAdapter(
+      prop_dim,
+      action_dim * self.depth_update_interval,
+      self.depth_shape,
+      device=self.device,
+      use_camera=bool(world_cfg.get("use_camera", True)),
+      config_overrides={
+        "dyn_deter": wm_feature_dim,
+        "model_lr": float(world_cfg.get("learning_rate", 1.0e-4)),
+        "train_steps_per_iter": int(world_cfg.get("train_steps_per_iter", 10)),
+        "train_start_steps": int(world_cfg.get("train_start_steps", 10000)),
+        "batch_size": int(world_cfg.get("batch_size", 16)),
+        "batch_length": int(world_cfg.get("batch_length", 64)),
+        "kl_free": float(world_cfg.get("kl_free", 1.0)),
+        "dyn_scale": float(world_cfg.get("dyn_scale", 0.5)),
+        "rep_scale": float(world_cfg.get("rep_scale", 0.1)),
+      },
+    ).to(self.device)
+    wm_feature_dim = self.world_model.feature_dim
     self.actor_critic = ActorCriticWMP(
       actor_dim,
       critic_dim,
@@ -70,24 +108,23 @@ class WMPRunner:
       history_dim=history_dim,
       history_length=history_length,
       hidden_dims=tuple(policy_cfg.get("hidden_dims", (512, 256, 128))),
+      encoder_hidden_dims=tuple(policy_cfg.get("encoder_hidden_dims", (256, 128))),
+      wm_encoder_hidden_dims=tuple(
+        policy_cfg.get("wm_encoder_hidden_dims", (64, 64))
+      ),
+      actor_hidden_dims=tuple(policy_cfg.get("actor_hidden_dims", (256, 128, 64))),
+      critic_hidden_dims=tuple(
+        policy_cfg.get("critic_hidden_dims", (512, 256, 128))
+      ),
       activation=policy_cfg.get("activation", "elu"),
-      history_latent_dim=int(policy_cfg.get("history_latent_dim", 128)),
+      history_latent_dim=int(policy_cfg.get("history_latent_dim", 35)),
       wm_feature_dim=wm_feature_dim,
-      wm_latent_dim=int(policy_cfg.get("wm_latent_dim", 64)),
+      wm_latent_dim=int(policy_cfg.get("wm_latent_dim", 32)),
       command_dim=self.command_dim,
       init_std=float(policy_cfg.get("init_std", 1.0)),
       min_std=policy_cfg.get("min_std"),
       max_std=policy_cfg.get("max_std"),
       command_slice=self.command_slice,
-    ).to(self.device)
-    self.world_model = SimpleWorldModel(
-      prop_dim,
-      action_dim,
-      depth_dim,
-      feature_dim=wm_feature_dim,
-      hidden_dims=tuple(world_cfg.get("hidden_dims", (512, 512))),
-      stoch_dim=int(world_cfg.get("stoch_dim", 32)),
-      min_std=float(world_cfg.get("min_std", 0.1)),
     ).to(self.device)
     self.depth_predictor = DepthPredictor(
       height_dim,
@@ -103,12 +140,20 @@ class WMPRunner:
     self.amp_normalizer = RunningNormalizer(amp_obs_dim).to(self.device)
 
     self.optimizer = torch.optim.Adam(
-      self.actor_critic.parameters(),
+      [
+        {"params": self.actor_critic.parameters(), "name": "actor_critic"},
+        {
+          "params": self.amp_discriminator.trunk.parameters(),
+          "weight_decay": 10.0e-4,
+          "name": "amp_trunk",
+        },
+        {
+          "params": self.amp_discriminator.amp_linear.parameters(),
+          "weight_decay": 10.0e-2,
+          "name": "amp_head",
+        },
+      ],
       lr=float(alg_cfg.get("learning_rate", 1.0e-3)),
-    )
-    self.world_optimizer = torch.optim.Adam(
-      self.world_model.parameters(),
-      lr=float(world_cfg.get("learning_rate", 3.0e-4)),
     )
     depth_params = list(self.depth_predictor.parameters())
     self.depth_optimizer = (
@@ -116,9 +161,10 @@ class WMPRunner:
       if depth_params
       else None
     )
-    self.amp_optimizer = torch.optim.Adam(
-      self.amp_discriminator.parameters(),
-      lr=float(amp_cfg.get("learning_rate", 1.0e-4)),
+    self.amp_replay_buffer = AMPReplayBuffer(
+      amp_obs_dim,
+      int(amp_cfg.get("replay_buffer_size", 100000)),
+      self.device,
     )
     self.motion_loader = MotionLoader(
       amp_cfg.get("expert_motion_files", ()),
@@ -136,13 +182,28 @@ class WMPRunner:
     self.history_length = history_length
     self.actor_dim = actor_dim
     self.history_dim = history_dim
+    self.critic_base_lin_vel_slice = self._resolve_critic_term_slice(
+      obs,
+      "base_lin_vel",
+    )
     self.learning_rate = float(alg_cfg.get("learning_rate", 1.0e-3))
+    self.world_model_dataset = DreamerEpisodeDataset(
+      limit_steps=int(world_cfg.get("dataset_size", 200000)),
+      seed=seed,
+    )
+    self._wm_episode_buffers = self._new_wm_episode_buffers()
+    self._wm_action_history = torch.zeros(
+      self.num_envs,
+      self.depth_update_interval,
+      action_dim,
+      device=self.device,
+    )
+    self._wm_reward_accum = torch.zeros(self.num_envs, device=self.device)
     self._history = (
       self._actor_history_obs(tensors["actor"])
       .unsqueeze(1)
       .repeat(1, history_length, 1)
     )
-    self.depth_update_interval = max(1, int(depth_cfg.get("camera_update_interval", 5)))
     self.num_camera_envs = min(
       self.num_envs, int(depth_cfg.get("camera_num_envs", self.num_envs))
     )
@@ -161,6 +222,18 @@ class WMPRunner:
     except Exception:
       return None
     return SummaryWriter(log_dir=os.path.join(log_dir, "summaries"))
+
+  def _depth_shape(self, obs) -> tuple[int, int, int]:
+    depth = self._group(obs, "wm_depth", "depth")
+    if depth.dim() == 4:
+      return int(depth.shape[1]), int(depth.shape[2]), int(depth.shape[3])
+    if depth.dim() == 3:
+      return int(depth.shape[1]), int(depth.shape[2]), 1
+    if depth.dim() == 2:
+      side = int(round(depth.shape[1] ** 0.5))
+      if side * side == depth.shape[1]:
+        return side, side, 1
+    raise ValueError(f"Cannot infer WMP depth image shape from {tuple(depth.shape)}.")
 
   def add_git_repo_to_log(self, repo_file_path: str) -> None:
     del repo_file_path
@@ -183,6 +256,15 @@ class WMPRunner:
       .unsqueeze(1)
       .repeat(1, self.history_length, 1)
     )
+    self.world_model.reset_state()
+    self._wm_episode_buffers = self._new_wm_episode_buffers()
+    self._wm_action_history.zero_()
+    self._wm_reward_accum.zero_()
+    self._wm_is_first = torch.ones(
+      self.num_envs,
+      device=self.device,
+      dtype=torch.bool,
+    )
     start = self.current_learning_iteration
     end = start + num_learning_iterations
     total_steps = (
@@ -198,15 +280,17 @@ class WMPRunner:
       update_stats = self._update_policy(rollout)
       ppo_time = time.time() - iter_start_time - collection_time
       world_start_time = time.time()
-      wm_stats = self._update_world_model(rollout)
+      wm_stats = self._update_world_model()
       world_time = time.time() - world_start_time
       depth_start_time = time.time()
       depth_stats = self._update_depth_predictor(rollout)
       depth_time = time.time() - depth_start_time
-      amp_start_time = time.time()
-      amp_stats = self._update_amp(rollout)
-      amp_time = time.time() - amp_start_time
-      learning_time = ppo_time + world_time + depth_time + amp_time
+      amp_stats = {
+        key.removeprefix("amp_"): value
+        for key, value in update_stats.items()
+        if key.startswith("amp_")
+      }
+      learning_time = ppo_time + world_time + depth_time
       iteration_time = time.time() - iter_start_time
       total_steps += self.num_steps_per_env * self.num_envs
       self.current_learning_iteration = iteration + 1
@@ -264,7 +348,12 @@ class WMPRunner:
       tensors = self._obs_to_tensors(obs)
       wm_depth, depth_target, depth_real_mask = self._depth_for_world_model(tensors)
       with torch.no_grad():
-        wm_feature = self.world_model.features(tensors["wm_prop"], wm_depth)
+        wm_action = self._wm_action_history.reshape(self.num_envs, -1)
+        wm_feature = self.world_model.features(
+          tensors["wm_prop"],
+          wm_depth,
+          wm_action,
+        )
         actions, log_prob, values = self.actor_critic.act(
           tensors["actor"],
           tensors["critic"],
@@ -319,6 +408,13 @@ class WMPRunner:
       storage["depth_real_mask"].append(depth_real_mask)
       storage["amp"].append(tensors["amp"])
       storage["next_amp"].append(next_tensors["amp"])
+      self._record_world_model_step(
+        tensors["wm_prop"],
+        wm_depth,
+        actions.detach(),
+        task_rewards.detach(),
+        dones.bool(),
+      )
       self._push_history(next_tensors["actor"], dones.bool())
       self._depth_step += 1
       obs = next_obs
@@ -328,6 +424,7 @@ class WMPRunner:
       last_feature = self.world_model.features(
         last_tensors["wm_prop"],
         last_tensors["depth"],
+        self._wm_action_history.reshape(self.num_envs, -1),
       )
       last_values = self.actor_critic.value(last_tensors["critic"], last_feature)
     rollout = {key: torch.stack(value, dim=0) for key, value in storage.items()}
@@ -361,6 +458,71 @@ class WMPRunner:
 
     return self._depth_cache.detach().clone(), raw_depth, real_mask
 
+  def _new_wm_episode_buffers(self) -> list[dict[str, list[torch.Tensor]]]:
+    return [
+      {"prop": [], "image": [], "action": [], "reward": [], "is_first": []}
+      for _ in range(self.num_envs)
+    ]
+
+  def _record_world_model_step(
+    self,
+    prop: torch.Tensor,
+    depth: torch.Tensor,
+    action: torch.Tensor,
+    reward: torch.Tensor,
+    done: torch.Tensor,
+  ) -> None:
+    self._wm_action_history = torch.roll(self._wm_action_history, shifts=-1, dims=1)
+    self._wm_action_history[:, -1, :] = action
+    self._wm_reward_accum += reward
+    should_write = (self._depth_step + 1) % self.depth_update_interval == 0
+    write_mask = done.clone()
+    if should_write:
+      write_mask |= torch.ones_like(done, dtype=torch.bool)
+    if write_mask.any():
+      image = self._depth_to_image(depth)
+      flat_action = self._wm_action_history.reshape(self.num_envs, -1)
+      ids = torch.nonzero(write_mask, as_tuple=False).flatten()
+      for env_id in ids.tolist():
+        buffer = self._wm_episode_buffers[env_id]
+        buffer["prop"].append(prop[env_id].detach().cpu())
+        buffer["image"].append(image[env_id].detach().cpu())
+        buffer["action"].append(flat_action[env_id].detach().cpu())
+        buffer["reward"].append(self._wm_reward_accum[env_id].detach().reshape(()).cpu())
+        buffer["is_first"].append(
+          self._wm_is_first[env_id].detach().float().reshape(()).cpu()
+        )
+      self._wm_reward_accum[write_mask] = 0.0
+      self._wm_is_first[write_mask] = False
+    if done.any():
+      ids = torch.nonzero(done, as_tuple=False).flatten()
+      for env_id in ids.tolist():
+        buffer = self._wm_episode_buffers[env_id]
+        if len(buffer["reward"]) >= 2:
+          self.world_model_dataset.add_episode(
+            {key: torch.stack(value, dim=0) for key, value in buffer.items()}
+          )
+        self._wm_episode_buffers[env_id] = {
+          "prop": [],
+          "image": [],
+          "action": [],
+          "reward": [],
+          "is_first": [],
+        }
+      self._wm_action_history[done] = 0.0
+      self._wm_reward_accum[done] = 0.0
+      self._wm_is_first[done] = True
+      self.world_model.reset_state(done)
+
+  def _depth_to_image(self, depth: torch.Tensor) -> torch.Tensor:
+    if depth.dim() == 2:
+      return depth.reshape(depth.shape[0], *self.depth_shape)
+    if depth.dim() == 3:
+      return depth.unsqueeze(-1)
+    if depth.dim() == 4:
+      return depth
+    raise ValueError(f"Unsupported depth shape for Dreamer image: {tuple(depth.shape)}")
+
   def _push_history(self, actor_obs: torch.Tensor, dones: torch.Tensor) -> None:
     history_obs = self._actor_history_obs(actor_obs)
     self._history = torch.roll(self._history, shifts=-1, dims=1)
@@ -390,9 +552,30 @@ class WMPRunner:
     return torch.cat((actor_obs[:, :start], actor_obs[:, end:]), dim=-1)
 
   def _critic_linear_velocity_target(self, critic_obs: torch.Tensor) -> torch.Tensor:
+    if hasattr(self, "critic_base_lin_vel_slice"):
+      start, end = self.critic_base_lin_vel_slice
+      if end > start and critic_obs.shape[-1] >= end:
+        return critic_obs[:, start:end]
     if critic_obs.shape[-1] < 3:
       return torch.zeros(critic_obs.shape[0], 3, device=critic_obs.device)
     return critic_obs[:, :3]
+
+  def _resolve_critic_term_slice(
+    self,
+    obs,
+    term_name: str,
+  ) -> tuple[int, int]:
+    critic = obs["critic"]
+    if torch.is_tensor(critic):
+      return 0, min(3, critic.shape[-1])
+    start = 0
+    for key, value in critic.items():
+      flat_dim = int(value.reshape(value.shape[0], -1).shape[-1])
+      end = start + flat_dim
+      if key == term_name:
+        return start, end
+      start = end
+    return 0, 0
 
   def _compute_returns(
     self,
@@ -423,6 +606,10 @@ class WMPRunner:
   def _update_policy(self, rollout: dict[str, Any]) -> dict[str, float]:
     returns, advantages = self._compute_returns(rollout)
     batch = self.num_steps_per_env * self.num_envs
+    policy_amp = rollout["amp"].reshape(batch, -1)
+    policy_next_amp = rollout["next_amp"].reshape(batch, -1)
+    if self.motion_loader.has_data:
+      self.amp_replay_buffer.insert(policy_amp, policy_next_amp)
     flat = {
       "actor": rollout["actor"].reshape(batch, -1),
       "critic": rollout["critic"].reshape(batch, -1),
@@ -461,6 +648,12 @@ class WMPRunner:
       "entropy": 0.0,
       "kl_mean": 0.0,
       "learning_rate": self.learning_rate,
+      "amp_loss": 0.0,
+      "amp_grad_penalty": 0.0,
+      "amp_policy_pred": 0.0,
+      "amp_expert_pred": 0.0,
+      "amp_policy_acc": 0.0,
+      "amp_expert_acc": 0.0,
     }
     updates = 0
     for _ in range(num_epochs):
@@ -530,9 +723,20 @@ class WMPRunner:
           + vel_predict_coef * vel_predict_loss
           - entropy_coef * entropy.mean()
         )
+        amp_loss = torch.zeros((), device=self.device)
+        amp_stats = self._amp_minibatch_loss(mini_batch_size)
+        if amp_stats is not None:
+          amp_loss, amp_loss_stats = amp_stats
+          loss = loss + amp_loss
+        else:
+          amp_loss_stats = None
         self.optimizer.zero_grad()
         loss.backward()
-        clip_grad_norm_(self.actor_critic.parameters(), max_grad_norm)
+        clip_grad_norm_(
+          list(self.actor_critic.parameters())
+          + list(self.amp_discriminator.parameters()),
+          max_grad_norm,
+        )
         self.optimizer.step()
         stats["policy_loss"] += float(policy_loss.detach())
         stats["value_loss"] += float(value_loss.detach())
@@ -540,44 +744,63 @@ class WMPRunner:
         stats["entropy"] += float(entropy.mean().detach())
         stats["kl_mean"] += float(kl_mean.detach())
         stats["learning_rate"] = self.learning_rate
+        if amp_loss_stats is not None:
+          stats["amp_loss"] += float(amp_loss.detach())
+          stats["amp_grad_penalty"] += float(amp_loss_stats["grad_penalty"])
+          stats["amp_policy_pred"] += float(amp_loss_stats["policy_pred"])
+          stats["amp_expert_pred"] += float(amp_loss_stats["expert_pred"])
+          stats["amp_policy_acc"] += float(amp_loss_stats["policy_acc"])
+          stats["amp_expert_acc"] += float(amp_loss_stats["expert_acc"])
         updates += 1
     return {key: value / max(1, updates) for key, value in stats.items()}
 
-  def _update_world_model(self, rollout: dict[str, Any]) -> dict[str, float]:
-    interval = int(self.cfg["world_model"].get("update_interval", 5))
-    if interval <= 0 or (self.current_learning_iteration + 1) % interval != 0:
+  def _amp_minibatch_loss(
+    self,
+    batch_size: int,
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | None:
+    if not self.motion_loader.has_data or not self.amp_replay_buffer.has_data:
+      return None
+    expert = self.motion_loader.sample(batch_size)
+    if expert is None:
+      return None
+    expert_amp = expert[:, : self.amp_discriminator.amp_obs_dim]
+    expert_next_amp = expert[:, self.amp_discriminator.amp_obs_dim :]
+    policy_amp, policy_next_amp = self.amp_replay_buffer.sample(batch_size)
+    if self.amp_normalize_input:
+      with torch.no_grad():
+        self.amp_normalizer.update(
+          torch.cat(
+            (
+              policy_amp,
+              policy_next_amp,
+              expert_amp,
+              expert_next_amp,
+            ),
+            dim=0,
+          )
+        )
+    policy_transitions = self._amp_transition(policy_amp, policy_next_amp)
+    expert_transitions = self._amp_transition(expert_amp, expert_next_amp)
+    return self.amp_discriminator.loss(policy_transitions, expert_transitions)
+
+  def _update_world_model(self) -> dict[str, float]:
+    world_cfg = self.cfg["world_model"]
+    train_start_steps = int(world_cfg.get("train_start_steps", 10000))
+    if self.world_model_dataset.num_steps < train_start_steps:
       return {}
-    prop = rollout["wm_prop"]
-    next_prop = rollout["next_wm_prop"]
-    actions = rollout["actions"]
-    rewards = rollout["task_rewards"]
-    dones = rollout["dones"]
-    depth = rollout["depth"]
-    loss, losses = self.world_model.loss(
-      prop,
-      actions,
-      next_prop,
-      rewards,
-      dones,
-      depth,
-      kl_free=float(self.cfg["world_model"].get("kl_free", 1.0)),
-      dyn_scale=float(self.cfg["world_model"].get("dyn_scale", 0.5)),
-      rep_scale=float(self.cfg["world_model"].get("rep_scale", 0.1)),
-      prop_loss_scale=float(self.cfg["world_model"].get("prop_loss_scale", 1.0)),
-      recon_loss_scale=float(self.cfg["world_model"].get("recon_loss_scale", 1.0)),
-      reward_loss_scale=float(self.cfg["world_model"].get("reward_loss_scale", 1.0)),
-      continue_loss_scale=float(
-        self.cfg["world_model"].get("continue_loss_scale", 1.0)
-      ),
-      depth_loss_scale=float(self.cfg["world_model"].get("depth_loss_scale", 0.1)),
-      latent_l2_scale=float(self.cfg["world_model"].get("latent_l2_scale", 1.0e-4)),
+    batch = self.world_model_dataset.sample(
+      int(world_cfg.get("batch_size", 16)),
+      int(world_cfg.get("batch_length", 64)),
     )
-    self.world_optimizer.zero_grad()
-    loss.backward()
-    self.world_optimizer.step()
-    out = {"loss": float(loss.detach())}
-    out.update({key: float(value) for key, value in losses.items()})
-    return out
+    if batch is None:
+      return {}
+    stats = self.world_model.train_world_model(
+      batch,
+      train_steps=int(world_cfg.get("train_steps_per_iter", 10)),
+    )
+    stats["dataset_steps"] = float(self.world_model_dataset.num_steps)
+    stats["dataset_episodes"] = float(self.world_model_dataset.num_episodes)
+    return stats
 
   def _update_depth_predictor(self, rollout: dict[str, Any]) -> dict[str, float]:
     if self.depth_optimizer is None:
@@ -610,58 +833,10 @@ class WMPRunner:
     return {"loss": float(loss.detach())}
 
   def _update_amp(self, rollout: dict[str, Any]) -> dict[str, float]:
-    if not self.motion_loader.has_data:
-      return {}
-    updates = int(self.cfg["amp"].get("updates_per_iteration", 1))
-    batch = self.num_steps_per_env * self.num_envs
-    policy_amp = rollout["amp"].reshape(batch, -1)
-    policy_next_amp = rollout["next_amp"].reshape(batch, -1)
-    stats = {
-      "loss": 0.0,
-      "amp_loss": 0.0,
-      "grad_penalty": 0.0,
-      "policy_pred": 0.0,
-      "expert_pred": 0.0,
-      "policy_acc": 0.0,
-      "expert_acc": 0.0,
-    }
-    count = 0
-    for _ in range(updates):
-      expert = self.motion_loader.sample(batch)
-      if expert is None:
-        break
-      expert_amp = expert[:, : self.amp_discriminator.amp_obs_dim]
-      expert_next_amp = expert[:, self.amp_discriminator.amp_obs_dim :]
-      if self.amp_normalize_input:
-        self.amp_normalizer.update(
-          torch.cat(
-            (
-              policy_amp,
-              policy_next_amp,
-              expert_amp,
-              expert_next_amp,
-            ),
-            dim=0,
-          )
-        )
-      policy_transitions = self._amp_transition(policy_amp, policy_next_amp)
-      expert_transitions = self._amp_transition(expert_amp, expert_next_amp)
-      loss, loss_stats = self.amp_discriminator.loss(
-        policy_transitions,
-        expert_transitions,
-      )
-      self.amp_optimizer.zero_grad()
-      loss.backward()
-      self.amp_optimizer.step()
-      stats["loss"] += float(loss.detach())
-      stats["amp_loss"] += float(loss_stats["amp_loss"])
-      stats["grad_penalty"] += float(loss_stats["grad_penalty"])
-      stats["policy_pred"] += float(loss_stats["policy_pred"])
-      stats["expert_pred"] += float(loss_stats["expert_pred"])
-      stats["policy_acc"] += float(loss_stats["policy_acc"])
-      stats["expert_acc"] += float(loss_stats["expert_acc"])
-      count += 1
-    return {key: value / max(1, count) for key, value in stats.items()}
+    del rollout
+    # AMP discriminator is updated jointly inside _update_policy, matching the
+    # original WMP AMPPPO optimizer/loss structure.
+    return {}
 
   def _normalize_amp_obs(self, obs: torch.Tensor) -> torch.Tensor:
     if not self.amp_normalize_input:
@@ -954,14 +1129,17 @@ class WMPRunner:
       "depth_predictor_state_dict": self.depth_predictor.state_dict(),
       "amp_discriminator_state_dict": self.amp_discriminator.state_dict(),
       "amp_normalizer_state_dict": self.amp_normalizer.state_dict(),
+      "amp_replay_buffer_state_dict": self.amp_replay_buffer.state_dict(),
+      "world_model_dataset_state_dict": self.world_model_dataset.state_dict(),
       "optimizer_state_dict": self.optimizer.state_dict(),
-      "world_optimizer_state_dict": self.world_optimizer.state_dict(),
       "depth_optimizer_state_dict": self.depth_optimizer.state_dict()
       if self.depth_optimizer is not None
       else None,
-      "amp_optimizer_state_dict": self.amp_optimizer.state_dict(),
       "runner_state": {
         "depth_step": self._depth_step,
+        "wm_action_history": self._wm_action_history.detach().cpu(),
+        "wm_reward_accum": self._wm_reward_accum.detach().cpu(),
+        "wm_is_first": self._wm_is_first.detach().cpu(),
       },
     }
     torch.save(state, path)
@@ -1001,14 +1179,20 @@ class WMPRunner:
         )
       if "optimizer_state_dict" in state:
         self.optimizer.load_state_dict(state["optimizer_state_dict"])
-      if "world_optimizer_state_dict" in state:
-        self.world_optimizer.load_state_dict(state["world_optimizer_state_dict"])
       if self.depth_optimizer is not None and state.get("depth_optimizer_state_dict"):
         self.depth_optimizer.load_state_dict(state["depth_optimizer_state_dict"])
-      if "amp_optimizer_state_dict" in state:
-        self.amp_optimizer.load_state_dict(state["amp_optimizer_state_dict"])
+      if "amp_replay_buffer_state_dict" in state:
+        self.amp_replay_buffer.load_state_dict(state["amp_replay_buffer_state_dict"])
+      if "world_model_dataset_state_dict" in state:
+        self.world_model_dataset.load_state_dict(state["world_model_dataset_state_dict"])
     runner_state = state.get("runner_state", {})
     self._depth_step = int(runner_state.get("depth_step", self._depth_step))
+    if "wm_action_history" in runner_state:
+      self._wm_action_history = runner_state["wm_action_history"].to(self.device)
+    if "wm_reward_accum" in runner_state:
+      self._wm_reward_accum = runner_state["wm_reward_accum"].to(self.device)
+    if "wm_is_first" in runner_state:
+      self._wm_is_first = runner_state["wm_is_first"].to(self.device)
     self.current_learning_iteration = int(state.get("iter", 0))
     infos = state.get("infos", {})
     if infos and "env_state" in infos:

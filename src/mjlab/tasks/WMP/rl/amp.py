@@ -52,6 +52,74 @@ class RunningNormalizer(nn.Module):
     return (samples - self.mean) / torch.sqrt(self.var + self.eps)
 
 
+class AMPReplayBuffer:
+  """Fixed-size replay buffer for policy AMP transitions."""
+
+  def __init__(self, obs_dim: int, buffer_size: int, device: torch.device) -> None:
+    self.obs_dim = int(obs_dim)
+    self.buffer_size = int(buffer_size)
+    self.device = device
+    self.states = torch.zeros(buffer_size, obs_dim, device=device)
+    self.next_states = torch.zeros(buffer_size, obs_dim, device=device)
+    self.step = 0
+    self.num_samples = 0
+
+  @property
+  def has_data(self) -> bool:
+    return self.num_samples > 0
+
+  def insert(self, states: torch.Tensor, next_states: torch.Tensor) -> None:
+    states = states.detach().to(self.device)
+    next_states = next_states.detach().to(self.device)
+    num_states = states.shape[0]
+    if num_states <= 0:
+      return
+    start = self.step
+    end = self.step + num_states
+    if end <= self.buffer_size:
+      self.states[start:end] = states
+      self.next_states[start:end] = next_states
+    else:
+      first = self.buffer_size - start
+      self.states[start:] = states[:first]
+      self.next_states[start:] = next_states[:first]
+      rest = end - self.buffer_size
+      self.states[:rest] = states[first:]
+      self.next_states[:rest] = next_states[first:]
+    self.num_samples = min(self.buffer_size, max(end, self.num_samples))
+    self.step = end % self.buffer_size
+
+  def sample(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if not self.has_data:
+      raise RuntimeError("Cannot sample an empty AMP replay buffer.")
+    ids = torch.randint(
+      self.num_samples,
+      (batch_size,),
+      device=self.device,
+    )
+    return self.states[ids], self.next_states[ids]
+
+  def state_dict(self) -> dict[str, torch.Tensor | int]:
+    return {
+      "states": self.states,
+      "next_states": self.next_states,
+      "step": self.step,
+      "num_samples": self.num_samples,
+      "buffer_size": self.buffer_size,
+    }
+
+  def load_state_dict(self, state: dict[str, torch.Tensor | int]) -> None:
+    states = state.get("states")
+    next_states = state.get("next_states")
+    if torch.is_tensor(states) and torch.is_tensor(next_states):
+      if states.shape == self.states.shape:
+        self.states.copy_(states.to(self.device))
+      if next_states.shape == self.next_states.shape:
+        self.next_states.copy_(next_states.to(self.device))
+    self.step = int(state.get("step", 0))
+    self.num_samples = int(state.get("num_samples", 0))
+
+
 class MotionLoader:
   def __init__(
     self,
@@ -235,10 +303,33 @@ class AMPDiscriminator(nn.Module):
     super().__init__()
     self.amp_obs_dim = amp_obs_dim
     self.transition_dim = amp_obs_dim * 2
-    self.net = build_mlp(self.transition_dim, hidden_dims, 1, activation)
+    if len(hidden_dims) == 0:
+      raise ValueError("AMP discriminator requires at least one hidden layer.")
+    self.trunk = build_mlp(
+      self.transition_dim,
+      hidden_dims[:-1],
+      hidden_dims[-1],
+      activation,
+    )
+    self.amp_linear = nn.Linear(hidden_dims[-1], 1)
+    self._net_override_name = "_wmp_net_override"
+
+  @property
+  def net(self) -> nn.Module:
+    override = self._modules.get(self._net_override_name) or self._modules.get("net")
+    if override is not None:
+      return override
+    return nn.Sequential(self.trunk, self.amp_linear)
+
+  @net.setter
+  def net(self, module: nn.Module) -> None:
+    self.add_module(self._net_override_name, module)
 
   def logits(self, transitions: torch.Tensor) -> torch.Tensor:
-    return self.net(transitions).squeeze(-1)
+    override = self._modules.get(self._net_override_name) or self._modules.get("net")
+    if override is not None:
+      return override(transitions).squeeze(-1)
+    return self.amp_linear(self.trunk(transitions)).squeeze(-1)
 
   def compute_grad_penalty(
     self,

@@ -126,6 +126,39 @@ def foot_contact_forces(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tenso
   return torch.sign(forces) * torch.log1p(torch.abs(forces))
 
 
+def foot_contact_forces_linear(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  scale: float = 0.005,
+) -> torch.Tensor:
+  sensor = env.scene[sensor_name]
+  assert isinstance(sensor, ContactSensor)
+  assert sensor.data.force is not None
+  return sensor.data.force.flatten(start_dim=1) * scale
+
+
+def privileged_randomization(
+  env: ManagerBasedRlEnv,
+  key: str,
+  *,
+  dim: int,
+  scale: float = 1.0,
+) -> torch.Tensor:
+  cache = getattr(env, "_wmp_privileged_randomization", {})
+  value = cache.get(key)
+  if value is None:
+    return torch.zeros(env.num_envs, dim, device=env.device)
+  value = value.to(device=env.device, dtype=torch.float32)
+  if value.shape[-1] != dim:
+    value = value.reshape(env.num_envs, -1)
+    if value.shape[-1] < dim:
+      pad = torch.zeros(env.num_envs, dim - value.shape[-1], device=env.device)
+      value = torch.cat((value, pad), dim=-1)
+    else:
+      value = value[:, :dim]
+  return value * scale
+
+
 def depth_image(
   env: ManagerBasedRlEnv,
   sensor_name: str,

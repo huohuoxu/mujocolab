@@ -382,24 +382,44 @@ def make_wmp_env_cfg(
   # critic 观测：actor terms 加上仿真/传感器特权状态
   # 保证 value function 训练时可以看更丰富的信息以实现更准确的价值估计，但这些信息不会暴露给部署策略
   critic_terms = {
+    "foot_contact": ObservationTermCfg(
+      func=mdp.foot_contact,
+      params={"sensor_name": "feet_ground_contact"},
+    ),
+    "foot_contact_forces": ObservationTermCfg(
+      func=mdp.foot_contact_forces_linear,
+      params={"sensor_name": "feet_ground_contact", "scale": 0.005},
+    ),
+    "d_gains": ObservationTermCfg(
+      func=mdp.privileged_randomization,
+      params={"key": "d_gains", "dim": 12, "scale": 5.0},
+    ),
+    "p_gains": ObservationTermCfg(
+      func=mdp.privileged_randomization,
+      params={"key": "p_gains", "dim": 12, "scale": 5.0},
+    ),
+    "base_com": ObservationTermCfg(
+      func=mdp.privileged_randomization,
+      params={"key": "base_com", "dim": 3, "scale": 20.0},
+    ),
+    "base_mass": ObservationTermCfg(
+      func=mdp.privileged_randomization,
+      params={"key": "base_mass", "dim": 1},
+    ),
+    "restitution": ObservationTermCfg(
+      func=mdp.privileged_randomization,
+      params={"key": "restitution", "dim": 1},
+    ),
+    "friction": ObservationTermCfg(
+      func=mdp.privileged_randomization,
+      params={"key": "friction", "dim": 1},
+    ),
     "base_lin_vel": ObservationTermCfg(func=mdp.base_lin_vel),
     **actor_terms,
     "height_scan": ObservationTermCfg(
       func=mdp.height_scan,
       params={"sensor_name": "terrain_scan"},
       scale=5.0,
-    ),
-    "foot_height": ObservationTermCfg(
-      func=mdp.foot_height,
-      params={"sensor_name": "foot_height_scan"},
-    ),
-    "foot_contact": ObservationTermCfg(
-      func=mdp.foot_contact,
-      params={"sensor_name": "feet_ground_contact"},
-    ),
-    "foot_contact_forces": ObservationTermCfg(
-      func=mdp.foot_contact_forces,
-      params={"sensor_name": "feet_ground_contact"},
     ),
   }
 
@@ -527,15 +547,22 @@ def make_wmp_env_cfg(
           "z": (0.01, 0.05),
           "yaw": (-math.pi, math.pi),
         },
-        "velocity_range": {},
+        "velocity_range": {
+          "x": (-0.5, 0.5),
+          "y": (-0.5, 0.5),
+          "z": (-0.5, 0.5),
+          "roll": (-0.5, 0.5),
+          "pitch": (-0.5, 0.5),
+          "yaw": (-0.5, 0.5),
+        },
       },
     ),
     # 每个 episode 从机器人默认关节姿态和零关节速度开始
     "reset_robot_joints": EventTermCfg(
-      func=mdp.reset_joints_by_offset,
+      func=mdp.reset_joints_by_scale,
       mode="reset",
       params={
-        "position_range": (0.0, 0.0),
+        "position_scale_range": (0.5, 1.5),
         "velocity_range": (0.0, 0.0),
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
       },
@@ -569,6 +596,15 @@ def make_wmp_env_cfg(
         "shared_random": True,
       },
     ),
+    "base_mass": EventTermCfg(
+      mode="startup",
+      func=dr.body_mass,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=("trunk",)),
+        "operation": "add",
+        "ranges": (0.0, 1.0),
+      },
+    ),
     # startup 域随机化：扰动 trunk 质心位置，这是应对质量分布误差的一个简单鲁棒性开关
     "base_com": EventTermCfg(
       mode="startup",
@@ -581,6 +617,33 @@ def make_wmp_env_cfg(
           1: (-0.05, 0.05),
           2: (-0.05, 0.05),
         },
+      },
+    ),
+    "pd_gains": EventTermCfg(
+      mode="startup",
+      func=dr.pd_gains,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",)),
+        "kp_range": (0.8, 1.2),
+        "kd_range": (0.8, 1.2),
+        "operation": "scale",
+      },
+    ),
+    "motor_strength": EventTermCfg(
+      mode="startup",
+      func=dr.effort_limits,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",)),
+        "effort_limit_range": (0.9, 1.1),
+        "operation": "scale",
+      },
+    ),
+    "cache_privileged_randomization": EventTermCfg(
+      mode="startup",
+      func=mdp.cache_privileged_randomization,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
+        "foot_geom_names": foot_geoms,
       },
     ),
   }

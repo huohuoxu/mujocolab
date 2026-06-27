@@ -25,13 +25,17 @@ def _default_motion_files() -> Tuple[str, ...]:
 @dataclass
 class WmpPolicyCfg:
   hidden_dims: Tuple[int, ...] = (512, 256, 128)
+  encoder_hidden_dims: Tuple[int, ...] = (256, 128)
+  wm_encoder_hidden_dims: Tuple[int, ...] = (64, 64)
+  actor_hidden_dims: Tuple[int, ...] = (256, 128, 64)
+  critic_hidden_dims: Tuple[int, ...] = (512, 256, 128)
   activation: str = "elu"
   history_length: int = 5
   history_exclude_command: bool = True
   clip_observations: float = 100.0
-  history_latent_dim: int = 128
-  wm_feature_dim: int = 128
-  wm_latent_dim: int = 64
+  history_latent_dim: int = 35
+  wm_feature_dim: int = 512
+  wm_latent_dim: int = 32
   command_dim: int = 3
   init_std: float = 1.0
   min_std: float | None = None
@@ -60,11 +64,18 @@ class WmpAlgorithmCfg:
 @dataclass
 class WmpWorldModelCfg:
   hidden_dims: Tuple[int, ...] = (512, 512)
-  feature_dim: int = 128
+  feature_dim: int = 512
+  dyn_deter: int = 512
   stoch_dim: int = 32
   min_std: float = 0.1
-  learning_rate: float = 3.0e-4
+  learning_rate: float = 1.0e-4
   update_interval: int = 5
+  train_start_steps: int = 10000
+  train_steps_per_iter: int = 10
+  batch_size: int = 16
+  batch_length: int = 64
+  dataset_size: int = 200000
+  use_camera: bool = True
   kl_free: float = 1.0
   dyn_scale: float = 0.5
   rep_scale: float = 0.1
